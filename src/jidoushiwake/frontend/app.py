@@ -682,10 +682,19 @@ class ReviewPage(QWidget):
         self.page_label = QLabel("1/1")
         self.page_prev.clicked.connect(lambda: self._change_page(-1))  # type: ignore[arg-type]
         self.page_next.clicked.connect(lambda: self._change_page(1))  # type: ignore[arg-type]
+        # Intra-PDF page navigation
+        self.pdf_prev = QPushButton("＜頁")
+        self.pdf_next = QPushButton("頁＞")
+        self.pdf_page_label = QLabel("0/0")
+        self.pdf_prev.clicked.connect(lambda: self._change_pdf_page(-1))  # type: ignore[arg-type]
+        self.pdf_next.clicked.connect(lambda: self._change_pdf_page(1))  # type: ignore[arg-type]
         util_row.addWidget(QLabel("税区分:"))
         util_row.addWidget(self.tax_combo)
         util_row.addWidget(apply_tax)
         util_row.addStretch(1)
+        util_row.addWidget(self.pdf_prev)
+        util_row.addWidget(self.pdf_page_label)
+        util_row.addWidget(self.pdf_next)
         util_row.addWidget(self.page_prev)
         util_row.addWidget(self.page_label)
         util_row.addWidget(self.page_next)
@@ -778,7 +787,7 @@ class ReviewPage(QWidget):
         self.invoice.setCurrentText(auto.get("invoice_status") or "")
 
     # -----------------------
-    # Journal-style grid helpers
+    # Journal-style grid helpers (per-PDF rendering)
     # -----------------------
     def _load_unconfirmed(self) -> None:
         try:
@@ -791,64 +800,97 @@ class ReviewPage(QWidget):
                 timeout=10,
             )
             if not r.ok:
+                self._docs = []
+                self._doc_index = 0
+                self._render_current_doc()
                 return
-            rows = list(r.json() or [])
-            self.table.setRowCount(len(rows) * 2)
-            self._row_to_id: list[int] = []
-            self._docs: list[dict] = rows
-            for i, d in enumerate(rows):
-                auto = d.get("auto") or {}
-                date = auto.get("date") or ""
-                amount = abs(auto.get("amount") or 0)
-                debit = auto.get("debit_account") or ""
-                credit = auto.get("credit_account") or ""
-                debit_sub = auto.get("debit_subaccount") or ""
-                credit_sub = auto.get("credit_subaccount") or ""
-                summary = auto.get("summary") or ""
-                tax = auto.get("invoice_status") or ""
-
-                r0 = i * 2
-                r1 = r0 + 1
-                # Row 1
-                vals_r1 = [
-                    date,
-                    debit,
-                    f"{amount:,}",
-                    credit,
-                    f"{amount:,}",
-                    summary,
-                    tax,
-                ]
-                for j, v in enumerate(vals_r1):
-                    # columns 5(summary) and 6(invoice) are provided as widgets
-                    if j in (5, 6):
-                        continue
-                    self.table.setItem(r0, j, QTableWidgetItem(str(v)))
-                # Row 2 (subs and tax under summary)
-                vals_r2 = [
-                    "",
-                    debit_sub,
-                    "",
-                    credit_sub,
-                    "",
-                    auto.get("invoice_status") or "",  # use invoice/tax status under summary
-                    "",
-                ]
-                for j, v in enumerate(vals_r2):
-                    # columns 1(debit_sub),3(credit_sub),5(tax) are widgets
-                    if j in (1, 3, 5):
-                        continue
-                    self.table.setItem(r1, j, QTableWidgetItem(str(v)))
-                # Map both rows to the same doc id
-                doc_id = int(d.get("id"))
-                self._row_to_id.extend([doc_id, doc_id])
-
-                # Setup pull-down widgets for this pair
-                self._setup_row_widgets(r0, r1, debit, credit, debit_sub, credit_sub, summary, tax)
+            self._docs = list(r.json() or [])
+            # Keep current index if possible; otherwise clamp
+            curr = getattr(self, "_doc_index", 0)
+            if not self._docs:
+                self._doc_index = 0
+            else:
+                self._doc_index = max(0, min(curr, len(self._docs) - 1))
+            self._render_current_doc()
         except Exception:
-            pass
+            try:
+                self._docs = []
+                self._doc_index = 0
+                self._render_current_doc()
+            except Exception:
+                pass
         finally:
             self._loading = False
+
+    def _render_current_doc(self) -> None:
+        # Update label with current doc position
+        total = len(getattr(self, "_docs", []))
+        idx = getattr(self, "_doc_index", 0)
+        try:
+            self.page_label.setText(f"{(idx+1) if total else 0}/{total}")
+        except Exception:
+            pass
+
+        # Clear table if no documents
+        if total == 0:
+            self.table.setRowCount(0)
+            self._row_to_id = []
+            self._show_pdf(None)
+            return
+
+        d = self._docs[idx]
+        auto = d.get("auto") or {}
+        date = auto.get("date") or ""
+        amount = abs(auto.get("amount") or 0)
+        debit = auto.get("debit_account") or ""
+        credit = auto.get("credit_account") or ""
+        debit_sub = auto.get("debit_subaccount") or ""
+        credit_sub = auto.get("credit_subaccount") or ""
+        summary = auto.get("summary") or ""
+        tax = auto.get("invoice_status") or ""
+
+        # Set up a 2-row table for this single PDF's entry
+        self.table.setRowCount(2)
+        self._row_to_id = [int(d.get("id")), int(d.get("id"))]
+
+        r0 = 0
+        r1 = 1
+        vals_r1 = [
+            date,
+            debit,
+            f"{amount:,}",
+            credit,
+            f"{amount:,}",
+            summary,
+            tax,
+        ]
+        for j, v in enumerate(vals_r1):
+            if j in (5, 6):
+                continue
+            self.table.setItem(r0, j, QTableWidgetItem(str(v)))
+
+        vals_r2 = [
+            "",
+            debit_sub,
+            "",
+            credit_sub,
+            "",
+            auto.get("invoice_status") or "",
+            "",
+        ]
+        for j, v in enumerate(vals_r2):
+            if j in (1, 3, 5):
+                continue
+            self.table.setItem(r1, j, QTableWidgetItem(str(v)))
+
+        self._setup_row_widgets(r0, r1, debit, credit, debit_sub, credit_sub, summary, tax)
+
+        # Show the current document's PDF (first page by default)
+        try:
+            self._pdf_page = 0
+            self._show_pdf(d.get("file_path"))
+        except Exception:
+            pass
 
     def _on_table_select(self) -> None:
         sel = self.table.selectedIndexes()
@@ -943,7 +985,7 @@ class ReviewPage(QWidget):
             try:
                 w = self.table.cellWidget(r, 5)
                 txt = item.text().strip()
-                from PyQt6.QtWidgets import QComboBox
+                # QComboBox is imported at module level; avoid local import to prevent scope issues
                 if isinstance(w, QComboBox) and txt:
                     w.setCurrentText(txt)
                 # remove overlay item to avoid double rendering
@@ -1005,16 +1047,37 @@ class ReviewPage(QWidget):
             w = max(320, self.pdf_label.width())
             pm = pm.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
             self.pdf_label.setPixmap(pm)
-            self.page_label.setText(f"{self._pdf_page+1}/{len(doc)}")
+            # Update intra-PDF page position label (keep doc navigation label separate)
+            try:
+                self.pdf_page_label.setText(f"{self._pdf_page+1}/{len(doc)}")
+            except Exception:
+                pass
             doc.close()
         except Exception as e:
             self.pdf_label.setText(f"PDF表示エラー\n{e}")
 
     def _change_page(self, delta: int) -> None:
+        # Repurposed: use '<' and '>' to move across PDFs
+        total = len(getattr(self, "_docs", []))
+        if total == 0:
+            return
+        idx = getattr(self, "_doc_index", 0) + delta
+        if idx < 0:
+            idx = 0
+        if idx >= total:
+            idx = total - 1
+        self._doc_index = idx
+        self._render_current_doc()
+
+    def _change_pdf_page(self, delta: int) -> None:
+        # Navigate within current PDF pages
         if not getattr(self, '_pdf_path', None):
             return
-        self._pdf_page = max(0, (getattr(self, '_pdf_page', 0) + delta))
-        self._show_pdf(self._pdf_path)
+        try:
+            self._pdf_page = max(0, (getattr(self, '_pdf_page', 0) + delta))
+            self._show_pdf(self._pdf_path)
+        except Exception:
+            pass
 
     def _apply_tax_combo(self) -> None:
         # apply selected tax category display name to table second row tax cell
