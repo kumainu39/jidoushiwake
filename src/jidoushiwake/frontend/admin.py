@@ -317,6 +317,8 @@ class AdminWindow(QMainWindow):
         self.rules_page = GlobalRulesPage()
         self.stack.addWidget(self.rules_page)
         self.setCentralWidget(self.stack)
+        # Child window holder to prevent GC
+        self._children = []
         menubar = self.menuBar()
         act_company = menubar.addAction("会社選択")
         act_company.triggered.connect(self.choose_company)  # type: ignore[arg-type]
@@ -339,6 +341,14 @@ class AdminWindow(QMainWindow):
                 win = MainWindow(dlg.selected)
                 win.resize(1200, 720)
                 win.show()
+                try:
+                    self._children.append(win)  # retain reference
+                except Exception:
+                    pass
+                try:
+                    self.close()
+                except Exception:
+                    pass
         except Exception:
             pass
 

@@ -88,12 +88,28 @@ async def api_import_pdf(company_name: str = Form(...), file: UploadFile = File(
     contents = await file.read()
     uploads_dir = Path("data") / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
-    dest = uploads_dir / file.filename
-    dest.write_bytes(contents)
+    original = uploads_dir / file.filename
+    original.write_bytes(contents)
+
+    # Accept both PDF and common image formats. If image, convert to a single-page PDF.
+    src_path = original
+    try:
+        if original.suffix.lower() not in (".pdf",):
+            from PIL import Image  # type: ignore
+
+            img = Image.open(str(original))
+            if img.mode in ("RGBA", "P"):  # convert to RGB for PDF
+                img = img.convert("RGB")
+            pdf_path = original.with_suffix(".pdf")
+            img.save(str(pdf_path), "PDF")
+            src_path = pdf_path
+    except Exception:
+        # If conversion fails, proceed with original; services.import_pdf will error clearly
+        src_path = original
 
     with get_session() as s:
         company = ensure_company(s, company_name)
-        doc = import_pdf(s, company.id, dest)
+        doc = import_pdf(s, company.id, src_path)
         auto = doc.auto_result
         return DocumentOut(
             id=doc.id,

@@ -158,10 +158,38 @@ def _extract_text_with_yomitoku(pdf_path: Path) -> str:
         import shutil
         import subprocess
         import tempfile
+        import sys
     except Exception:
         return ""
 
-    if not shutil.which("yomitoku"):
+    def _resolve_yomitoku_exe() -> Optional[str]:
+        # 1) PATH
+        p = shutil.which("yomitoku")
+        if p:
+            return p
+        # 2) Same directory as current Python (useful when running from venv)
+        try:
+            here = Path(sys.executable).parent
+            for name in ("yomitoku.exe", "yomitoku"):
+                cand = here / name
+                if cand.exists():
+                    return str(cand)
+        except Exception:
+            pass
+        # 3) Common local venv folders relative to CWD
+        for rel in (".venv/Scripts/yomitoku.exe", ".venv/bin/yomitoku", "venv/Scripts/yomitoku.exe", "venv/bin/yomitoku"):
+            cand = Path.cwd() / rel
+            if cand.exists():
+                return str(cand)
+        # 4) Environment override
+        env_p = os.getenv("YOMITOKU_EXE")
+        if env_p and Path(env_p).exists():
+            return env_p
+        return None
+
+    _yomi_exe = _resolve_yomitoku_exe()
+    if not _yomi_exe:
+        LOGGER.info("yomitoku CLI not found in PATH or local venv; skipping YOMITOKU OCR")
         return ""
 
     try:
@@ -172,7 +200,7 @@ def _extract_text_with_yomitoku(pdf_path: Path) -> str:
         out_dir.mkdir(parents=True, exist_ok=True)
         fmt = os.getenv("YOMITOKU_FORMAT", "md")
         cmd = [
-            "yomitoku",
+            _yomi_exe,
             str(pdf_path),
             "-f", fmt,
             "--combine",
@@ -251,9 +279,28 @@ DATE_PATTERNS = [
     re.compile(r"(\d{4})(\d{2})(\d{2})"),
 ]
 
+# Accept half-width and full-width digits/symbols. We normalize before parsing, but
+# keep a permissive regex as well to catch mixed strings.
 YEN_AMOUNT_PATTERNS = [
-    re.compile(r"([\-−]?)\s*¥?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)\s*(?:円)?"),
+    # Optional sign, optional Yen symbol, number (1,234 or 1234), optional 円
+    re.compile(r"([\-−]?)\s*[¥￥]?\s*([0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[0-9０-９]+)\s*(?:円)?"),
 ]
+
+# Translation table for full-width to half-width digits and punctuation used in amounts
+_FW_TO_HW = str.maketrans({
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    "，": ",", "．": ".", "￥": "¥", "－": "-", "―": "-", "ー": "-",
+})
+
+def _normalize_amount_text(s: str) -> str:
+    # Translate common full-width chars and collapse internal spaces
+    s = s.translate(_FW_TO_HW)
+    # Replace unusual thin/non-breaking spaces if present
+    s = s.replace("\u2009", " ").replace("\u00A0", " ")
+    # Some OCR introduces spaces between digits: "8 0 0" → "800"
+    s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
+    return s
 
 
 def _norm_date(y: str, m: str, d: str) -> Optional[str]:
@@ -276,6 +323,8 @@ def _find_date(text: str) -> Optional[str]:
 
 
 def _parse_int_amount(s: str, sign: str = "") -> int:
+    # Normalize then strip thousands separators
+    s = _normalize_amount_text(s)
     s = s.replace(",", "")
     try:
         val = int(s)
@@ -287,16 +336,21 @@ def _parse_int_amount(s: str, sign: str = "") -> int:
 def _find_amount(text: str) -> Optional[int]:
     candidates: list[tuple[int, int]] = []
     for line in text.splitlines():
+        # Keep original for keyword checks; normalize for number matching
         lowered = line.lower()
+        norm_line = _normalize_amount_text(line)
         weight = 1
-        if any(k in lowered for k in ("合計", "計", "金額", "精算", "請求額", "税込", "支払")):
+        if any(k in lowered for k in ("合計", "計", "金額", "精算", "請求額", "税込", "支払")) or ("円" in line or "¥" in line or "￥" in line):
             weight = 3
         for pat in YEN_AMOUNT_PATTERNS:
-            for m in pat.finditer(line):
+            for m in pat.finditer(norm_line):
                 sign = m.group(1) or ""
                 num = m.group(2)
                 amount = _parse_int_amount(num, sign)
                 if amount == 0:
+                    continue
+                # Heuristic: if the line has no currency/amount cue, ignore unusually long numbers (likely IDs)
+                if weight < 3 and len(re.sub(r"\D", "", num)) > 6:
                     continue
                 candidates.append((weight * abs(amount), amount))
     if not candidates:

@@ -5,6 +5,7 @@ import threading
 import uvicorn
 
 from src.jidoushiwake.api.app import app
+# ユーザー提供の最新UI（app.py）を使用
 from src.jidoushiwake.frontend.app import run_ui
 
 
