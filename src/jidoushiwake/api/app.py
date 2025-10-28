@@ -436,6 +436,8 @@ class LLMSettings(BaseModel):
     device: str = "cpu"  # cpu or gpu
     n_gpu_layers: int = 0
     n_threads: int = 4
+    use_colab_remote: bool = False
+    remote_base_url: Optional[str] = None
 
 
 _LLM_SETTINGS: LLMSettings = LLMSettings()
@@ -457,6 +459,8 @@ def api_set_llm_settings(payload: LLMSettings):
         device=_LLM_SETTINGS.device,
         n_gpu_layers=_LLM_SETTINGS.n_gpu_layers,
         n_threads=_LLM_SETTINGS.n_threads,
+        use_colab_remote=_LLM_SETTINGS.use_colab_remote,
+        remote_base_url=_LLM_SETTINGS.remote_base_url or LLMConfig().remote_base_url,
     )
     set_llm_config(cfg)
     return _LLM_SETTINGS
@@ -476,6 +480,8 @@ class CompanyLLMSettingsIn(BaseModel):
     n_threads: int = 4
     lora_path: Optional[str] = None
     prompt_template: Optional[str] = None
+    use_colab: bool = False
+    remote_base_url: Optional[str] = None
 
 
 class CompanyLLMSettingsOut(BaseModel):
@@ -487,6 +493,8 @@ class CompanyLLMSettingsOut(BaseModel):
     n_threads: int
     lora_path: Optional[str]
     prompt_template: Optional[str]
+    use_colab: bool
+    remote_base_url: Optional[str]
 
 
 @app.get("/company_llm_settings", response_model=CompanyLLMSettingsOut)
@@ -507,6 +515,8 @@ def api_get_company_llm_settings(company_name: str):
             n_threads=cs.n_threads,
             lora_path=cs.lora_path,
             prompt_template=cs.prompt_template,
+            use_colab=bool(getattr(cs, "use_colab", 0)),
+            remote_base_url=getattr(cs, "remote_base_url", None),
         )
 
 
@@ -526,6 +536,8 @@ def api_set_company_llm_settings(payload: CompanyLLMSettingsIn):
         cs.n_threads = payload.n_threads
         cs.lora_path = payload.lora_path
         cs.prompt_template = payload.prompt_template
+        cs.use_colab = 1 if payload.use_colab else 0
+        cs.remote_base_url = payload.remote_base_url
         s.flush()
         return CompanyLLMSettingsOut(
             use_override=bool(cs.use_override),
@@ -536,6 +548,8 @@ def api_set_company_llm_settings(payload: CompanyLLMSettingsIn):
             n_threads=cs.n_threads,
             lora_path=cs.lora_path,
             prompt_template=cs.prompt_template,
+            use_colab=bool(getattr(cs, "use_colab", 0)),
+            remote_base_url=getattr(cs, "remote_base_url", None),
         )
 
 

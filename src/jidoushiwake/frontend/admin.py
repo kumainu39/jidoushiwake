@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QStackedWidget,
     QListWidget,
+    QDialog,
 )
 import requests
 from PyQt6.QtWidgets import QListWidgetItem, QCheckBox, QTextEdit
@@ -80,14 +81,25 @@ class LLMSettingsPage(QWidget):
         form = QFormLayout()
         self.provider = QLineEdit("llama-cpp")
         self.model_path = QLineEdit()
-        self.device = QLineEdit("cpu")  # "cpu" or "gpu"
+        # Device selection: dropdown (cpu/gpu)
+        from PyQt6.QtWidgets import QComboBox
+        self.device = QComboBox()
+        try:
+            self.device.addItems(["cpu", "gpu"])
+        except Exception:
+            pass
         self.n_gpu_layers = QLineEdit("0")
         self.n_threads = QLineEdit("4")
+        self.use_colab = QCheckBox("コラボを使用 (CPU のみ)")
+        self.remote_base_url = QLineEdit()
+        self.remote_base_url.setPlaceholderText("https://xxxx.ngrok-free.dev など")
         form.addRow("Provider", self.provider)
         form.addRow("Model Path (GGUF)", self.model_path)
         form.addRow("Device (cpu/gpu)", self.device)
         form.addRow("GPU Layers", self.n_gpu_layers)
         form.addRow("Threads", self.n_threads)
+        form.addRow(" ", self.use_colab)
+        form.addRow("Colab URL", self.remote_base_url)
         save = QPushButton("保存")
         save.clicked.connect(self.save)  # type: ignore[arg-type]
         layout.addLayout(form)
@@ -103,9 +115,22 @@ class LLMSettingsPage(QWidget):
                 data = r.json()
                 self.provider.setText(data.get("provider") or "llama-cpp")
                 self.model_path.setText(data.get("model_path") or "")
-                self.device.setText(data.get("device") or "cpu")
+                # Ensure device combobox reflects current value
+                dev = data.get("device") or "cpu"
+                try:
+                    if dev not in [self.device.itemText(i) for i in range(self.device.count())]:
+                        self.device.addItem(dev)
+                    self.device.setCurrentText(dev)
+                except Exception:
+                    # Fallback if combobox is not available
+                    try:
+                        self.device.setEditText(dev)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
                 self.n_gpu_layers.setText(str(data.get("n_gpu_layers") or "0"))
                 self.n_threads.setText(str(data.get("n_threads") or "4"))
+                self.use_colab.setChecked(bool(data.get("use_colab_remote") or False))
+                self.remote_base_url.setText(data.get("remote_base_url") or "")
         except Exception:
             pass
 
@@ -113,10 +138,14 @@ class LLMSettingsPage(QWidget):
         payload = {
             "provider": self.provider.text().strip() or "llama-cpp",
             "model_path": self.model_path.text().strip() or None,
-            "device": self.device.text().strip() or "cpu",
+            "device": (self.device.currentText().strip() if hasattr(self.device, 'currentText') else 'cpu') or "cpu",
             "n_gpu_layers": int(self.n_gpu_layers.text()) if self.n_gpu_layers.text().strip() else 0,
             "n_threads": int(self.n_threads.text()) if self.n_threads.text().strip() else 4,
+            "use_colab_remote": bool(self.use_colab.isChecked()),
+            "remote_base_url": self.remote_base_url.text().strip() or None,
         }
+        if payload.get("use_colab_remote"):
+            payload["device"] = "cpu"
         try:
             r = requests.post(f"{API_URL}/admin/llm_settings", json=payload, timeout=10)
             if r.ok:
@@ -289,6 +318,8 @@ class AdminWindow(QMainWindow):
         self.stack.addWidget(self.rules_page)
         self.setCentralWidget(self.stack)
         menubar = self.menuBar()
+        act_company = menubar.addAction("会社選択")
+        act_company.triggered.connect(self.choose_company)  # type: ignore[arg-type]
         act_rules = menubar.addAction("自動仕訳ルール")
         act_ocr = menubar.addAction("PaddleOCR")
         act_llm = menubar.addAction("LLM設定")
@@ -296,6 +327,20 @@ class AdminWindow(QMainWindow):
         act_llm.triggered.connect(lambda: self.stack.setCurrentIndex(1))  # type: ignore[arg-type]
         act_rules.triggered.connect(lambda: self.stack.setCurrentIndex(2))  # type: ignore[arg-type]
 
+    def choose_company(self) -> None:
+        try:
+            from .app import CompanySelector, MainWindow
+        except Exception:
+            return
+        try:
+            dlg = CompanySelector()
+            res = dlg.exec()
+            if res == QDialog.DialogCode.Accepted and getattr(dlg, 'selected', None):
+                win = MainWindow(dlg.selected)
+                win.resize(1200, 720)
+                win.show()
+        except Exception:
+            pass
 
 def create_admin_window() -> AdminWindow:
     win = AdminWindow()

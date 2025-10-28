@@ -28,3 +28,6 @@ psycopg2-binary>=2.9,<3
 
 # Packaging (optional, for building .exe)
 pyinstaller>=6,<7
+
+# Japanese tokenizer
+yomitoku

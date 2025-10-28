@@ -5,6 +5,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from typing import Optional
+import os
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -62,6 +63,12 @@ def init_db() -> None:
                 conn.exec_driver_sql("ALTER TABLE auto_results ADD COLUMN credit_subaccount VARCHAR(64)")
             if "invoice_status" not in a_cols:
                 conn.exec_driver_sql("ALTER TABLE auto_results ADD COLUMN invoice_status VARCHAR(16)")
+            # CompanyLLMSetting new columns
+            cl_cols = [row[1] for row in conn.exec_driver_sql("PRAGMA table_info('company_llm_settings')").all()]
+            if "use_colab" not in cl_cols:
+                conn.exec_driver_sql("ALTER TABLE company_llm_settings ADD COLUMN use_colab INTEGER DEFAULT 0")
+            if "remote_base_url" not in cl_cols:
+                conn.exec_driver_sql("ALTER TABLE company_llm_settings ADD COLUMN remote_base_url TEXT")
             # tax category stored as short code in invoice_status for now; also ensure tax_categories table exists
             conn.exec_driver_sql(
                 "CREATE TABLE IF NOT EXISTS tax_categories (\n"
@@ -135,6 +142,8 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
                 n_threads=c_llm.n_threads,
                 lora_path=c_llm.lora_path,
                 prompt_template=c_llm.prompt_template,
+                use_colab_remote=bool(getattr(c_llm, "use_colab_remote", getattr(c_llm, "use_colab", 0)) or False),
+                remote_base_url=(getattr(c_llm, "remote_base_url", None) or os.getenv("JIDOU_LLM_REMOTE_BASE") or "http://localhost:8005"),
             )
             with temporary_config(cfg):
                 # Feed YOMITOKU first (if available) in the image OCR slot to prioritize it.

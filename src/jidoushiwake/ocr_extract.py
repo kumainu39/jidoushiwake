@@ -112,15 +112,48 @@ def _extract_text_with_paddle(pdf_path: Path) -> str:
 
 
 def _extract_text_with_yomitoku(pdf_path: Path) -> str:
-    """Best-effort OCR via YOMITOKU CLI (not a Python library).
+    """OCR via YOMITOKU.
 
-    Expects `yomitoku` command to be available in PATH. Mirrors the
-    typical usage:
-        yomitoku <pdf> -f md --combine --encoding utf-8 -o <outdir>
-
-    Returns concatenated text from generated files (preferring .md).
-    Returns empty string if CLI is not available or on failure.
+    1) Prefer Python library (if installed).
+    2) Fallback to CLI `yomitoku` if available.
+    Returns empty string on failure.
     """
+    # 1) Try library first (best-effort: support a few common APIs)
+    try:
+        # Attempt import patterns
+        try:
+            import yomitoku as _yomi  # type: ignore
+        except Exception:
+            _yomi = None  # type: ignore
+        if _yomi is not None:
+            text: str | None = None
+            # Common patterns: extract_text(path) or convert(path) -> str
+            for attr in ("extract_text", "convert", "to_text", "extract"):
+                func = getattr(_yomi, attr, None)
+                if callable(func):
+                    try:
+                        text = func(str(pdf_path))  # type: ignore[misc]
+                        if isinstance(text, str) and text.strip():
+                            return text
+                    except Exception:
+                        pass
+            # Some libs expose module .api with similar functions
+            api = getattr(_yomi, "api", None)
+            if api is not None:
+                for attr in ("extract_text", "convert", "to_text"):
+                    func = getattr(api, attr, None)
+                    if callable(func):
+                        try:
+                            text = func(str(pdf_path))  # type: ignore[misc]
+                            if isinstance(text, str) and text.strip():
+                                return text
+                        except Exception:
+                            pass
+    except Exception:
+        # Ignore and continue to CLI fallback
+        pass
+
+    # 2) CLI fallback
     try:
         import shutil
         import subprocess
@@ -132,39 +165,41 @@ def _extract_text_with_yomitoku(pdf_path: Path) -> str:
         return ""
 
     try:
-        with tempfile.TemporaryDirectory() as td:
-            out_dir = Path(td) / "yomitoku_output"
-            out_dir.mkdir(parents=True, exist_ok=True)
-            fmt = os.getenv("YOMITOKU_FORMAT", "md")
-            cmd = [
-                "yomitoku",
-                str(pdf_path),
-                "-f", fmt,
-                "--combine",
-                "--encoding", "utf-8",
-                "-o", str(out_dir),
-            ]
-            try:
-                subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                return ""
+        # Mirror the behavior of the provided sample (test2.py):
+        # write results next to the PDF under a fixed folder name so users can inspect them.
+        base_dir = pdf_path.parent
+        out_dir = base_dir / "yomitoku_output"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fmt = os.getenv("YOMITOKU_FORMAT", "md")
+        cmd = [
+            "yomitoku",
+            str(pdf_path),
+            "-f", fmt,
+            "--combine",
+            "--encoding", "utf-8",
+            "-o", str(out_dir),
+        ]
+        try:
+            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            return ""
 
-            # Prefer reading .md files, then .txt, then any text-like files
-            collected: list[str] = []
-            patterns = ["**/*.md", "**/*.txt", "**/*.json", "**/*.*"]
-            for pat in patterns:
-                for f in sorted(out_dir.glob(pat)):
-                    if f.is_dir():
-                        continue
-                    try:
-                        txt = f.read_text(encoding="utf-8", errors="ignore")
-                        if txt and txt.strip():
-                            collected.append(txt)
-                    except Exception:
-                        continue
-                if collected:
-                    break
-            return "\n\n".join(collected)
+        collected: list[str] = []
+        # Prefer combined .md, then other text formats
+        patterns = ["**/*.md", "**/*.txt", "**/*.json", "**/*.*"]
+        for pat in patterns:
+            for f in sorted(out_dir.glob(pat)):
+                if f.is_dir():
+                    continue
+                try:
+                    txt = f.read_text(encoding="utf-8", errors="ignore")
+                    if txt and txt.strip():
+                        collected.append(txt)
+                except Exception:
+                    continue
+            if collected:
+                break
+        return "\n\n".join(collected)
     except Exception:
         return ""
 

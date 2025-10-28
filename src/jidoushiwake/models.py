@@ -174,6 +174,9 @@ class CompanyLLMSetting(Base):
     n_threads: Mapped[int] = mapped_column(Integer, default=4)
     lora_path: Mapped[Optional[str]] = mapped_column(Text, default=None)
     prompt_template: Mapped[Optional[str]] = mapped_column(Text, default=None)
+    # When device=="cpu": allow opting into Colab/remote HTTP usage
+    use_colab: Mapped[int] = mapped_column(Integer, default=0)  # 1=True, 0=False
+    remote_base_url: Mapped[Optional[str]] = mapped_column(Text, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

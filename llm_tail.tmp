@@ -1,0 +1,220 @@
+        "2種類�EOCR結果�E�EDF埋め込み層、画像OCR�E�を渡します、En"
+        "取引�E基本頁E���E�日付YYYY/MM/DD、E��額整数、摘要E4斁E��以冁E��借方勘定科目、貸方勘定科目�E�を推定し、\n"
+        "信頼度(0から1)を含めてJSONで返してください、En"
+        "出力キー: date, amount, summary, debit_account, credit_account.\n"
+        "金額�E数値のみ。日付�EYYYY/MM/DD。未知はnull。confidenceは0.0-1.0、En\n"
+        "[PDF埋め込みチE��スチE\n" + (text_pdf or "") + "\n\n"
+        "[画像OCR(PaddleOCR)]\n" + (text_paddle or "") + "\n\n"
+        "JSONだけを出力してください、E
+    )
+    prompt = _apply_template(base_prompt)
+
+    if _CFG.device == "gpu":
+        llm = _load_llama()
+        if not llm:
+            return None
+        try:
+            res = llm.create_completion(prompt=prompt, max_tokens=256, temperature=0.2, stop=["\n\n"])  # type: ignore
+            text = res["choices"][0]["text"].strip()
+            data = json.loads(text)
+            return {
+                "date": data.get("date"),
+                "amount": data.get("amount"),
+                "summary": data.get("summary"),
+                "debit_account": data.get("debit_account"),
+                "credit_account": data.get("credit_account"),
+                "confidence": data.get("confidence"),
+            }
+        except Exception as e:
+            LOGGER.warning("LLM refine failed: %s", e)
+            return None
+
+    # CPU: remote HTTP (Colab/tunnel). Probe first to avoid long hangs when offline.
+    try:
+        if not _remote_alive():
+            return None
+        text = _http_complete(prompt, max_tokens=256, temperature=0.2, stop=["\n\n"]) or ""
+        text = text.strip()
+        if not text:
+            return None
+        data = json.loads(text)
+        return {
+            "date": data.get("date"),
+            "amount": data.get("amount"),
+            "summary": data.get("summary"),
+            "debit_account": data.get("debit_account"),
+            "credit_account": data.get("credit_account"),
+            "confidence": data.get("confidence"),
+        }
+    except Exception as e:
+        LOGGER.warning("Remote LLM refine failed: %s", e)
+        return None
+
+
+def refine_extraction_with_yomi(text_pdf: str, text_yomitoku: str = "", text_paddle: str = "") -> Optional[Dict[str, Any]]:
+    """Refine field extraction using up to three sources: PDF text, YOMITOKU, and image OCR.
+
+    Prefer YOMITOKU when available by presenting it explicitly to the LLM.
+    Returns dict or None.
+    """
+    sections: list[str] = []
+    sections.append("[PDF埋め込みチE��スチE\n" + (text_pdf or ""))
+    if (text_yomitoku or "").strip():
+        sections.append("[YOMITOKU(マ�Eクダウン結合)]\n" + (text_yomitoku or ""))
+    if (text_paddle or "").strip():
+        sections.append("[画像OCR(PaddleOCR)]\n" + (text_paddle or ""))
+
+    base_prompt = (
+        "以下�E領収書・請求書などの日本語OCRチE��ストです、En"
+        "最大3種類�E結果�E�EDF埋め込み層、YOMITOKU、画像OCR�E�を渡します、En"
+        "取引�E基本頁E���E�＝日付YYYY/MM/DD、E��額整数、摘要E4字以冁E��借方勘定科目、貸方勘定科目�E�を推定し、\n"
+        "信頼度(0から1)を含めてJSONで返してください、En"
+        "出力キー: date, amount, summary, debit_account, credit_account、En"
+        "金額�E数値のみ。日付�EYYYY/MM/DD。未知はnull。confidenceは0.0-1.0、En\n"
+        + "\n\n".join(sections)
+        + "\n\nJSONだけを出力してください。余計な説明�E不要です、En"
+    )
+    prompt = _apply_template(base_prompt)
+
+    if _CFG.device == "gpu":
+        llm = _load_llama()
+        if not llm:
+            return None
+        try:
+            res = llm.create_completion(prompt=prompt, max_tokens=256, temperature=0.2, stop=["\n\n"])  # type: ignore
+            text = res["choices"][0]["text"].strip()
+            data = json.loads(text)
+            return {
+                "date": data.get("date"),
+                "amount": data.get("amount"),
+                "summary": data.get("summary"),
+                "debit_account": data.get("debit_account"),
+                "credit_account": data.get("credit_account"),
+                "confidence": data.get("confidence"),
+            }
+        except Exception as e:
+            LOGGER.warning("LLM refine (with yomi) failed: %s", e)
+            return None
+
+    # CPU: remote HTTP (Colab/tunnel). Probe first to avoid long hangs when offline.
+    try:
+        if not _remote_alive():
+            return None
+        text = _http_complete(prompt, max_tokens=256, temperature=0.2, stop=["\n\n"]) or ""
+        text = text.strip()
+        if not text:
+            return None
+        data = json.loads(text)
+        return {
+            "date": data.get("date"),
+            "amount": data.get("amount"),
+            "summary": data.get("summary"),
+            "debit_account": data.get("debit_account"),
+            "credit_account": data.get("credit_account"),
+            "confidence": data.get("confidence"),
+        }
+    except Exception as e:
+        LOGGER.warning("Remote LLM refine (with yomi) failed: %s", e)
+        return None
+
+
+def parse_nl_rule(instruction: str) -> Optional[Dict[str, Any]]:
+    """Parse a natural language rule instruction into JSON using LLM when available,
+    otherwise a heuristic fallback.
+    Returns dict with keys: keyword, debit_account, credit_account, priority, enabled.
+    """
+    instr = (instruction or "").strip()
+    if not instr:
+        return None
+
+    if _CFG.device == "gpu":
+        llm = _load_llama()
+        if llm:
+            try:
+                base_prompt = (
+                    "以下�E自然言語�E持E��から、仕訳の初期設定ルールを抽出し、JSONで返してください、En"
+                    "忁E��キー: keyword, debit_account, credit_account. 任意キー: priority(整数), enabled(真偽).\n"
+                    "キーワード�EOCRチE��ストに含まれる想定�E識別語。借方/貸方は勘定科目名、En"
+                    "優先度の既定�E0、enabledの既定�Etrue、En"
+                    "出力�EJSONのみ。余計な説明を付けなぁE��En\n"
+                    f"持E��: {instr}\n"
+                )
+                prompt = _apply_template(base_prompt)
+                res = llm.create_completion(prompt=prompt, max_tokens=200, temperature=0.1, stop=["\n\n"])  # type: ignore
+                text = res["choices"][0]["text"].strip()
+                data = json.loads(text)
+                return {
+                    "keyword": (data.get("keyword") or "").strip(),
+                    "debit_account": (data.get("debit_account") or "").strip(),
+                    "credit_account": (data.get("credit_account") or "").strip(),
+                    "priority": int(data.get("priority") or 0),
+                    "enabled": bool(data.get("enabled") if data.get("enabled") is not None else True),
+                }
+            except Exception as e:
+                LOGGER.warning("LLM parse_nl_rule failed: %s", e)
+
+    # CPU: remote HTTP
+    if _CFG.device == "cpu":
+        try:
+            base_prompt = (
+                "以下�E自然言語�E持E��から、仕訳の初期設定ルールを抽出し、JSONで返してください、En"
+                "忁E��キー: keyword, debit_account, credit_account. 任意キー: priority(整数), enabled(真偽).\n"
+                "キーワード�EOCRチE��ストに含まれる想定�E識別語。借方/貸方は勘定科目名、En"
+                "優先度の既定�E0、enabledの既定�Etrue、En"
+                "出力�EJSONのみ。余計な説明を付けなぁE��En\n"
+                f"持E��: {instr}\n"
+            )
+            prompt = _apply_template(base_prompt)
+            if not _remote_alive():
+                raise RuntimeError("LLM remote not available")
+            text = _http_complete(prompt, max_tokens=200, temperature=0.1, stop=["\n\n"]) or ""
+            text = text.strip()
+            if text:
+                data = json.loads(text)
+                return {
+                    "keyword": (data.get("keyword") or "").strip(),
+                    "debit_account": (data.get("debit_account") or "").strip(),
+                    "credit_account": (data.get("credit_account") or "").strip(),
+                    "priority": int(data.get("priority") or 0),
+                    "enabled": bool(data.get("enabled") if data.get("enabled") is not None else True),
+                }
+        except Exception as e:
+            LOGGER.warning("Remote parse_nl_rule failed: %s", e)
+
+    # Fallback heuristic parsing
+    import re
+
+    def _find_accounts(s: str) -> Tuple[Optional[str], Optional[str]]:
+        m = re.search(r"([\w一-龥ぁEんァ-ヴー・]+)\s*[\/→��=>]\s*([\w一-龥ぁEんァ-ヴー・]+)", s)
+        if m:
+            return m.group(1), m.group(2)
+        md = re.search(r"借方(?:科目)?[:�E�]?\s*([\w一-龥ぁEんァ-ヴー・]+)", s)
+        mc = re.search(r"貸方(?:科目)?[:�E�]?\s*([\w一-龥ぁEんァ-ヴー・]+)", s)
+        return (md.group(1) if md else None, mc.group(1) if mc else None)
+
+    def _find_keyword(s: str) -> Optional[str]:
+        q = re.search(r"[『「\"]([^『「\"]+)[』」\"]", s)
+        if q:
+            return q.group(1).strip()
+        h = re.search(r"([\w一-龥ぁEんァ-ヴー・]+)は", s)
+        if h:
+            return h.group(1).strip()
+        t = re.search(r"([\w一-龥ぁEんァ-ヴー・]{3,})", s)
+        return t.group(1).strip() if t else None
+
+    debit, credit = _find_accounts(instr)
+    keyword = _find_keyword(instr)
+    prio = 0
+    en = True
+    mprio = re.search(r"優先度[:�E�]?\s*(-?\d+)", instr)
+    if mprio:
+        try:
+            prio = int(mprio.group(1))
+        except Exception:
+            pass
+    if re.search(r"無効|disable|off", instr, re.IGNORECASE):
+        en = False
+
+    if not keyword or not debit or not credit:
+        return None
+    return {"keyword": keyword, "debit_account": debit, "credit_account": credit, "priority": prio, "enabled": en}
