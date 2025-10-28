@@ -23,9 +23,21 @@ from ..services import (
     update_company_settings,
     get_account_settings,
     upsert_account_setting,
+    list_global_rules,
+    upsert_global_rule,
+    delete_global_rule,
+    upsert_keyword_mapping,
+    find_duplicate_candidates,
+    get_document_detail,
+    list_tax_categories,
+    import_accounts_pdf_to_company,
+    import_accounts_from_text,
+    import_account_master_from_text,
+    list_account_master,
 )
 from ..ocr_master import OCRMasterSample, OCRMasterSettings
 from ..llm_client import LLMConfig, set_config as set_llm_config
+from ..llm_client import parse_nl_rule
 from ..db import get_session
 from sqlalchemy import select, func
 
@@ -320,6 +332,103 @@ def api_set_ocr_settings(payload: OCRSettingsIn):
         )
 
 
+# Admin: Global Auto-Journal Rules (initial defaults)
+class GlobalRuleIn(BaseModel):
+    id: Optional[int] = None
+    keyword: str
+    debit_account: str
+    credit_account: str
+    priority: int = 0
+    enabled: bool = True
+
+
+class GlobalRuleOut(BaseModel):
+    id: int
+    keyword: str
+    debit_account: str
+    credit_account: str
+    priority: int
+    enabled: bool
+
+
+@app.get("/admin/global_rules", response_model=list[GlobalRuleOut])
+def api_list_global_rules():
+    with get_session() as s:
+        rows = list_global_rules(s)
+        out: list[GlobalRuleOut] = []
+        for r in rows:
+            out.append(
+                GlobalRuleOut(
+                    id=r.id,
+                    keyword=r.keyword,
+                    debit_account=r.debit_account,
+                    credit_account=r.credit_account,
+                    priority=r.priority,
+                    enabled=bool(r.enabled),
+                )
+            )
+        return out
+
+
+@app.post("/admin/global_rules", response_model=GlobalRuleOut)
+def api_upsert_global_rule(payload: GlobalRuleIn):
+    with get_session() as s:
+        r = upsert_global_rule(
+            s,
+            payload.id,
+            payload.keyword,
+            payload.debit_account,
+            payload.credit_account,
+            payload.priority,
+            payload.enabled,
+        )
+        return GlobalRuleOut(
+            id=r.id,
+            keyword=r.keyword,
+            debit_account=r.debit_account,
+            credit_account=r.credit_account,
+            priority=r.priority,
+            enabled=bool(r.enabled),
+        )
+
+
+@app.delete("/admin/global_rules/{rule_id}")
+def api_delete_global_rule(rule_id: int):
+    with get_session() as s:
+        delete_global_rule(s, rule_id)
+        return {"ok": True}
+
+
+# Natural language → Global Rule
+class NLRuleIn(BaseModel):
+    instruction: str
+
+
+@app.post("/admin/nl_global_rule", response_model=GlobalRuleOut)
+def api_nl_global_rule(payload: NLRuleIn):
+    data = parse_nl_rule(payload.instruction)
+    if not data:
+        raise HTTPException(status_code=400, detail="指示を解析できませんでした")
+    with get_session() as s:
+        r = upsert_global_rule(
+            s,
+            None,
+            data["keyword"],
+            data["debit_account"],
+            data["credit_account"],
+            int(data.get("priority", 0)),
+            bool(data.get("enabled", True)),
+        )
+        return GlobalRuleOut(
+            id=r.id,
+            keyword=r.keyword,
+            debit_account=r.debit_account,
+            credit_account=r.credit_account,
+            priority=r.priority,
+            enabled=bool(r.enabled),
+        )
+
+
 # Admin: LLM settings (stored simply in-memory/env-like via settings table placeholder)
 class LLMSettings(BaseModel):
     provider: str = "llama-cpp"
@@ -457,3 +566,175 @@ def api_get_company_llm_logs(company_name: str, limit: int = 50):
                 )
             )
         return out
+
+
+# Duplicate detection
+class DuplicateDoc(BaseModel):
+    id: int
+    file_path: str
+    status: str
+    auto: Optional[dict]
+
+
+class DuplicateMatchOut(BaseModel):
+    score: int
+    document: DuplicateDoc
+
+
+class DuplicateGroupOut(BaseModel):
+    new: DuplicateDoc
+    matches: list[DuplicateMatchOut]
+
+
+@app.get("/duplicates", response_model=list[DuplicateGroupOut])
+def api_list_duplicates(company_name: str):
+    with get_session() as s:
+        company = ensure_company(s, company_name)
+        groups = find_duplicate_candidates(s, company.id)
+        out: list[DuplicateGroupOut] = []
+        for g in groups:
+            new_d = g["new"]
+            matches = [
+                DuplicateMatchOut(
+                    score=m.get("score") or 0,
+                    document=DuplicateDoc(
+                        id=m["document"]["id"],
+                        file_path=m["document"]["file_path"],
+                        status=m["document"]["status"],
+                        auto=m["document"].get("auto"),
+                    ),
+                )
+                for m in g.get("matches", [])
+            ]
+            out.append(
+                DuplicateGroupOut(
+                    new=DuplicateDoc(
+                        id=new_d["id"], file_path=new_d["file_path"], status=new_d["status"], auto=new_d.get("auto")
+                    ),
+                    matches=matches,
+                )
+            )
+        return out
+
+
+class DuplicatePairOut(BaseModel):
+    new: DuplicateDoc
+    old: DuplicateDoc
+
+
+@app.get("/duplicate_pair", response_model=DuplicatePairOut)
+def api_duplicate_pair(new_id: int, old_id: int):
+    with get_session() as s:
+        new_d = get_document_detail(s, new_id)
+        old_d = get_document_detail(s, old_id)
+        return DuplicatePairOut(
+            new=DuplicateDoc(id=new_d["id"], file_path=new_d["file_path"], status=new_d["status"], auto=new_d.get("auto")),
+            old=DuplicateDoc(id=old_d["id"], file_path=old_d["file_path"], status=old_d["status"], auto=old_d.get("auto")),
+        )
+
+
+# Tax categories
+class TaxCategoryOut(BaseModel):
+    code: str
+    name: str
+    abbrev: str | None
+
+
+@app.get("/tax_categories", response_model=list[TaxCategoryOut])
+def api_tax_categories():
+    with get_session() as s:
+        rows = list_tax_categories(s)
+        return [TaxCategoryOut(code=r.code, name=r.name, abbrev=r.abbrev) for r in rows]
+
+
+class ImportAccountsIn(BaseModel):
+    company_name: str
+    path: str
+
+
+class ImportAccountsOut(BaseModel):
+    imported: int
+
+
+@app.post("/admin/import_accounts_pdf", response_model=ImportAccountsOut)
+def api_import_accounts_pdf(payload: ImportAccountsIn):
+    p = Path(payload.path)
+    if not p.exists():
+        raise HTTPException(status_code=400, detail=f"PDF not found: {p}")
+    with get_session() as s:
+        company = ensure_company(s, payload.company_name)
+        n = import_accounts_pdf_to_company(s, company.id, p)
+        return ImportAccountsOut(imported=n)
+
+
+class ImportAccountsTextIn(BaseModel):
+    company_name: str
+    text: str
+
+
+@app.post("/admin/import_accounts_text", response_model=ImportAccountsOut)
+def api_import_accounts_text(payload: ImportAccountsTextIn):
+    with get_session() as s:
+        company = ensure_company(s, payload.company_name)
+        n = import_accounts_from_text(s, company.id, payload.text)
+        return ImportAccountsOut(imported=n)
+
+
+# Global account master (company-agnostic)
+class MasterImportIn(BaseModel):
+    text: str
+
+
+class MasterAccountOut(BaseModel):
+    code: str | None
+    name: str
+
+
+@app.post("/admin/account_master_import_text", response_model=ImportAccountsOut)
+def api_account_master_import(payload: MasterImportIn):
+    with get_session() as s:
+        n = import_account_master_from_text(s, payload.text)
+        return ImportAccountsOut(imported=n)
+
+
+@app.get("/admin/account_master", response_model=list[MasterAccountOut])
+def api_account_master_list():
+    with get_session() as s:
+        rows = list_account_master(s)
+        return [MasterAccountOut(code=r.code, name=r.name) for r in rows]
+
+
+# Natural language → Company keyword mapping
+class CompanyNLIn(BaseModel):
+    company_name: str
+    instruction: str
+
+
+class KeywordMappingOut(BaseModel):
+    keyword: str
+    debit_account: str
+    credit_account: str
+    weight: int
+
+
+@app.post("/company_nl_mapping", response_model=KeywordMappingOut)
+def api_company_nl_mapping(payload: CompanyNLIn):
+    data = parse_nl_rule(payload.instruction)
+    if not data:
+        raise HTTPException(status_code=400, detail="指示を解析できませんでした")
+    with get_session() as s:
+        company = ensure_company(s, payload.company_name)
+        row = upsert_keyword_mapping(
+            s,
+            company.id,
+            data["keyword"],
+            data["debit_account"],
+            data["credit_account"],
+            1,
+        )
+        return KeywordMappingOut(
+            keyword=row.keyword,
+            debit_account=row.debit_account,
+            credit_account=row.credit_account,
+            weight=row.weight,
+        )

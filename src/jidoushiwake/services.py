@@ -20,14 +20,18 @@ from .models import (
     Document,
     DocumentStatusEnum,
     KeywordMapping,
+    GlobalRule,
     CompanySetting,
     CompanyLLMSetting,
     LLMLog,
     AccountSetting,
+    TaxCategory,
+    AccountMaster,
 )
 from .ocr_extract import extract_text_from_pdf, extract_journal_data, extract_text_both
 from .yayoi_exporter import AccountSide, JournalEntry, JournalExporter
 from .llm_client import refine_extraction
+from .llm_client import parse_nl_rule
 
 
 def init_db() -> None:
@@ -58,10 +62,42 @@ def init_db() -> None:
                 conn.exec_driver_sql("ALTER TABLE auto_results ADD COLUMN credit_subaccount VARCHAR(64)")
             if "invoice_status" not in a_cols:
                 conn.exec_driver_sql("ALTER TABLE auto_results ADD COLUMN invoice_status VARCHAR(16)")
+            # tax category stored as short code in invoice_status for now; also ensure tax_categories table exists
+            conn.exec_driver_sql(
+                "CREATE TABLE IF NOT EXISTS tax_categories (\n"
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+                "code VARCHAR(32) UNIQUE,\n"
+                "name VARCHAR(128),\n"
+                "abbrev VARCHAR(64),\n"
+                "active INTEGER DEFAULT 1\n"
+                ")"
+            )
     except Exception:
         # Never block app startup due to migration helper; the API will surface
         # errors if the column truly cannot be added (e.g., permissions).
         pass
+
+    # Seed tax categories if empty
+    with get_session() as s:
+        try:
+            cnt = s.query(TaxCategory).count()
+        except Exception:
+            cnt = 0
+        if cnt == 0:
+            seeds = [
+                ("TAISHOGAI", "対象外", "対象外"),
+                ("KZ_URI_10", "課税売上10%", "課税売上10%"),
+                ("KZ_URI_8K", "課税売上8%（軽）", "課税売上8%(軽)"),
+                ("KZ_SHI_10", "課税仕入10%", "課対仕入10%"),
+                ("KZ_SHI_8K", "課税仕入8%（軽）", "課対仕入8%(軽)"),
+                ("HIZEI_URI", "非課税売上", "非課売上"),
+                ("HIZEI_SHI", "非課税仕入", "非課仕入"),
+                ("YUSHUTS_URI", "輸出売上", "輸出売上"),
+                ("YUSHUTS_SHI", "輸出仕入", "輸出仕入"),
+            ]
+            for code, name, abbr in seeds:
+                s.add(TaxCategory(code=code, name=name, abbrev=abbr, active=1))
+            s.flush()
 
 
 def ensure_company(session: Session, name: str) -> Company:
@@ -150,12 +186,29 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
     except Exception:
         pass
 
-    # Apply per-company keyword mappings to refine accounts
+    # Apply global rules (initial defaults) then per-company mappings to refine accounts
     debit = parsed.debit_account
     credit = parsed.credit_account
     applied_score = 0
+
+    # First, apply enabled GlobalRule by highest priority if accounts are not already set
+    try:
+        text_lower = (text_combined or "").lower()
+        if not (debit and credit):
+            for gr in session.scalars(
+                select(GlobalRule).where(GlobalRule.enabled == 1).order_by(GlobalRule.priority.desc(), GlobalRule.id.asc())
+            ):
+                if gr.keyword and (gr.keyword.lower() in text_lower):
+                    debit = debit or gr.debit_account
+                    credit = credit or gr.credit_account
+                    # Only apply the first matching highest-priority rule as initial default
+                    break
+    except Exception:
+        pass
+
+    # Then, apply per-company keyword mappings (can override if explicitly set)
     for km in session.scalars(select(KeywordMapping).where(KeywordMapping.company_id == company_id)):
-        if km.keyword and (km.keyword.lower() in text.lower()):
+        if km.keyword and (km.keyword.lower() in text_lower):
             if km.debit_account:
                 debit = km.debit_account
             if km.credit_account:
@@ -528,6 +581,298 @@ def upsert_account_setting(
     else:
         row.subaccounts_json = subs_json
         row.summaries_json = sums_json
+        session.add(row)
+    session.flush()
+    return row
+
+
+def list_tax_categories(session: Session) -> list[TaxCategory]:
+    return list(session.scalars(select(TaxCategory).where(TaxCategory.active == 1).order_by(TaxCategory.name)))
+
+
+# Duplicate detection helpers
+def _doc_auto_dict(doc: Document) -> dict:
+    ar = doc.auto_result
+    return {
+        "id": doc.id,
+        "file_path": doc.file_path,
+        "status": doc.status,
+        "auto": {
+            "date": ar.date if ar else None,
+            "amount": ar.amount if ar else None,
+            "summary": ar.summary if ar else "",
+            "debit_account": ar.debit_account if ar else "",
+            "credit_account": ar.credit_account if ar else "",
+            "counterparty": ar.counterparty if ar else "",
+            "invoice_status": getattr(ar, "invoice_status", None) if ar else None,
+        },
+    }
+
+
+def find_duplicate_candidates(session: Session, company_id: int) -> list[dict]:
+    """Return a list of potential duplicate matches for new (unconfirmed) documents.
+
+    Strategy: for each unconfirmed document with an auto_result, look for other
+    documents in the same company with the same date and amount. A simple score
+    is computed and only matches with score>=2 are returned.
+    """
+    out: list[dict] = []
+    from sqlalchemy import and_
+
+    # Unconfirmed docs as new targets
+    new_docs = list(
+        session.scalars(
+            select(Document).where(
+                Document.company_id == company_id,
+                Document.status == DocumentStatusEnum.UNCONFIRMED.value,
+            )
+        )
+    )
+    for nd in new_docs:
+        nd_ar = nd.auto_result
+        if not nd_ar:
+            continue
+        nd_date = (nd_ar.date or "").strip()
+        nd_amt = nd_ar.amount
+        if not nd_date or nd_amt is None:
+            continue
+        # Candidate set: same amount and same date
+        cands = list(
+            session.scalars(
+                select(Document).where(
+                    Document.company_id == company_id,
+                    Document.id != nd.id,
+                )
+            )
+        )
+        matches: list[dict] = []
+        for od in cands:
+            oa = od.auto_result
+            if not oa:
+                continue
+            score = 0
+            if oa.amount == nd_amt:
+                score += 1
+            if (oa.date or "").strip() == nd_date:
+                score += 1
+            # lightweight summary hint
+            ns = (nd_ar.summary or "").strip().lower()
+            os = (oa.summary or "").strip().lower()
+            if ns and os and (ns[:10] == os[:10]):
+                score += 1
+            if score >= 2:
+                matches.append({"score": score, "document": _doc_auto_dict(od)})
+        if matches:
+            # sort best first
+            matches.sort(key=lambda m: m.get("score", 0), reverse=True)
+            out.append({"new": _doc_auto_dict(nd), "matches": matches})
+    return out
+
+
+def get_document_detail(session: Session, document_id: int) -> dict:
+    doc = session.get(Document, document_id)
+    if not doc:
+        raise ValueError("Document not found")
+    return _doc_auto_dict(doc)
+
+
+# Global rule helpers (initial default auto-journal rules)
+def list_global_rules(session: Session) -> list[GlobalRule]:
+    return list(
+        session.scalars(
+            select(GlobalRule).order_by(GlobalRule.enabled.desc(), GlobalRule.priority.desc(), GlobalRule.id.asc())
+        )
+    )
+
+
+def upsert_global_rule(
+    session: Session,
+    rule_id: Optional[int],
+    keyword: str,
+    debit_account: str,
+    credit_account: str,
+    priority: int = 0,
+    enabled: bool = True,
+) -> GlobalRule:
+    if rule_id:
+        row = session.get(GlobalRule, rule_id)
+    else:
+        row = None
+    if not row:
+        row = GlobalRule(
+            keyword=keyword,
+            debit_account=debit_account,
+            credit_account=credit_account,
+            priority=priority,
+            enabled=1 if enabled else 0,
+        )
+        session.add(row)
+    else:
+        row.keyword = keyword
+        row.debit_account = debit_account
+        row.credit_account = credit_account
+        row.priority = priority
+        row.enabled = 1 if enabled else 0
+        session.add(row)
+    session.flush()
+    return row
+
+
+def delete_global_rule(session: Session, rule_id: int) -> None:
+    row = session.get(GlobalRule, rule_id)
+    if row:
+        session.delete(row)
+
+
+# Import account names from a PDF into company AccountSetting rows
+def import_accounts_pdf_to_company(session: Session, company_id: int, pdf_path: Path) -> int:
+    try:
+        from pdfminer.high_level import extract_text  # type: ignore
+    except Exception:
+        raise RuntimeError("pdfminer.six is required to parse the PDF. Please install requirements.")
+
+    text = extract_text(str(pdf_path)) or ""
+    lines = [l.strip() for l in text.splitlines()]
+    count = 0
+
+    import re
+
+    for ln in lines:
+        if not ln:
+            continue
+        if any(k in ln for k in ("勘定科目", "一覧", "税区分", "部門", "補助", "摘要", "コード", "Code")):
+            continue
+        name = None
+        m = re.match(r"^\s*(\d{2,4})\s+(.+)$", ln)
+        if m:
+            name = m.group(2).strip()
+        else:
+            name = ln.strip()
+        # basic sanity
+        if len(name) < 2 or len(name) > 32:
+            continue
+        if not re.search(r"[\w一-龥ぁ-んァ-ヴ]", name):
+            continue
+        try:
+            upsert_account_setting(session, company_id, name, None, None)
+            count += 1
+        except Exception:
+            # ignore duplicates or parsing oddities
+            pass
+    session.flush()
+    return count
+
+
+def import_accounts_from_text(session: Session, company_id: int, text: str) -> int:
+    """Import account names from a plain text list.
+
+    Expected patterns per line (examples):
+      - 現金 GENKIN 100
+      - 売上高 URIAGE 700
+      - 単なる見出しや空行はスキップ
+    Only the leading Japanese name is stored as account_name.
+    """
+    lines = [l.strip() for l in (text or "").splitlines()]
+    if not lines:
+        return 0
+    count = 0
+    import re
+
+    # Heuristic: heading keywords to skip
+    skip_kw = ("資産の部", "流動資産", "固定資産", "繰延資産", "諸口", "負債の部", "流動負債", "固定負債", "純資産の部", "収益の部", "売上高", "売上原価", "販売費および一般管理費", "営業外", "特別損益", "など")
+
+    seen: set[str] = set()
+    for ln in lines:
+        if not ln:
+            continue
+        if any(k in ln for k in skip_kw):
+            continue
+        # match: <japanese name> <UPPERCODE> [number]
+        m = re.match(r"^([\u3040-\u30ff\u3400-\u9fffA-Za-z0-9（）・\-]+?)\s+[A-Z\-]+(?:\s+\d+)?\s*$", ln)
+        if m:
+            name = m.group(1).strip()
+        else:
+            # If no code token, skip (likely a heading or noise)
+            continue
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        try:
+            upsert_account_setting(session, company_id, name, None, None)
+            count += 1
+        except Exception:
+            pass
+    session.flush()
+    return count
+
+
+def import_account_master_from_text(session: Session, text: str) -> int:
+    """Import global master account names from pasted plain text.
+
+    Pattern: 日本語名称 + 英大文字コード + 任意の番号 を優先。重複はスキップ。
+    """
+    lines = [l.strip() for l in (text or "").splitlines()]
+    if not lines:
+        return 0
+    import re
+    skip_kw = ("資産の部", "流動資産", "固定資産", "繰延資産", "諸口", "負債の部", "流動負債", "固定負債", "純資産の部", "収益の部", "売上高", "売上原価", "販売費および一般管理費", "営業外", "特別損益", "など")
+    seen = set()
+    count = 0
+    for ln in lines:
+        if not ln or any(k in ln for k in skip_kw):
+            continue
+        m = re.match(r"^([\u3040-\u30ff\u3400-\u9fffA-Za-z0-9（）・\-]+?)\s+([A-Z\-]+)(?:\s+\d+)?\s*$", ln)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        code = m.group(2).strip()
+        if not name:
+            continue
+        key = (name, code)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            row = session.scalar(select(AccountMaster).where(AccountMaster.name == name))
+            if not row:
+                session.add(AccountMaster(name=name, code=code))
+                count += 1
+        except Exception:
+            pass
+    session.flush()
+    return count
+
+
+def list_account_master(session: Session) -> list[AccountMaster]:
+    return list(session.scalars(select(AccountMaster).order_by(AccountMaster.name)))
+
+# Keyword mapping upsert for company-level NL instructions
+def upsert_keyword_mapping(
+    session: Session,
+    company_id: int,
+    keyword: str,
+    debit_account: str,
+    credit_account: str,
+    weight: int = 1,
+) -> KeywordMapping:
+    row = session.scalar(
+        select(KeywordMapping).where(
+            KeywordMapping.company_id == company_id, KeywordMapping.keyword == keyword
+        )
+    )
+    if not row:
+        row = KeywordMapping(
+            company_id=company_id,
+            keyword=keyword,
+            debit_account=debit_account,
+            credit_account=credit_account,
+            weight=weight,
+        )
+        session.add(row)
+    else:
+        row.debit_account = debit_account or row.debit_account
+        row.credit_account = credit_account or row.credit_account
+        row.weight = max(weight, row.weight)
         session.add(row)
     session.flush()
     return row

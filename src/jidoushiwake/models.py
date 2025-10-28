@@ -21,6 +21,41 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
 
+class TaxCategory(Base):
+    __tablename__ = "tax_categories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    abbrev: Mapped[Optional[str]] = mapped_column(String(64), default=None)
+    active: Mapped[int] = mapped_column(Integer, default=1)
+
+
+class AccountMaster(Base):
+    __tablename__ = "account_master"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[Optional[str]] = mapped_column(String(32), unique=True, index=True, default=None)
+    name: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    category: Mapped[Optional[str]] = mapped_column(String(64), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class GlobalRule(Base):
+    __tablename__ = "global_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Simple keyword contains match against OCR text
+    keyword: Mapped[str] = mapped_column(String(64), index=True)
+    debit_account: Mapped[str] = mapped_column(String(64), default="")
+    credit_account: Mapped[str] = mapped_column(String(64), default="")
+    priority: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    enabled: Mapped[int] = mapped_column(Integer, default=1)  # 1=True, 0=False
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Company(Base):
     __tablename__ = "companies"
 
