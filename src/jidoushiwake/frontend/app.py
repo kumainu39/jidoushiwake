@@ -2,6 +2,8 @@
 
 import sys
 from functools import partial
+import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +25,8 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -42,6 +46,71 @@ from .admin import create_admin_window
 
 
 API_URL = "http://127.0.0.1:8765"
+
+
+# UI configurable settings
+def _load_ui_settings() -> dict:
+    defaults = {
+        "pdf_label_min_width": 480,
+        "pdf_label_max_width": 0,  # 0 = no limit
+        "pdf_fixed_width": 420,
+        "pdf_scale_ratio": 1.25,
+        "pdf_scale_ratio_min": 0.0,
+        "pdf_scale_ratio_max": 2.0,
+        "pdf_max_width_px": 0,  # 0 = auto
+        "nl_group_min_height": 60,
+        "nl_group_max_height": 0,
+        "nl_edit_min_height": 120,
+        "nl_edit_max_height": 0,
+        "nl_reserved_height_px": 180,
+        "left_container_min_width": 520,
+        "left_container_max_width": 0,
+        "left_scroll_min_width": 500,
+        "left_scroll_max_width": 0,
+        "splitter_stretch_left": 3,
+        "splitter_stretch_right": 4,
+        "splitter_min_left_px": 600,
+        "splitter_left_ratio": 0.4,
+        "splitter_max_left_px": 0,
+        "splitter_left_max_ratio": 1.0,
+        # New: right side target ratio and left side min ratio
+        "splitter_right_ratio": 0.0,        # 0 = unused; if >0, left_ratio := 1-right_ratio
+        "splitter_left_min_ratio": 0.0,     # lower bound ratio for left
+        # New: allow exact left width specification
+        "splitter_left_fixed_px": 0,
+        "splitter_left_fixed_ratio": 0.0,
+        # New: only apply splitter policy on maximize
+        "apply_splitter_only_when_maximized": True,
+    }
+    path_env = os.environ.get("JIDOU_UI_SETTINGS")
+    candidate_paths: list[Path] = []
+    try:
+        if path_env:
+            candidate_paths.append(Path(path_env))
+    except Exception:
+        pass
+    try:
+        candidate_paths.append(Path.cwd() / "ui_settings.json")
+        candidate_paths.append(Path.cwd() / "config" / "ui_settings.json")
+        repo_root_guess = Path(__file__).resolve().parents[3]
+        candidate_paths.append(repo_root_guess / "config" / "ui_settings.json")
+    except Exception:
+        pass
+    for p in candidate_paths:
+        try:
+            if p.is_file():
+                with p.open("r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict):
+                    merged = {**defaults, **data}
+                    return merged
+        except Exception:
+            # On parse error or other issues, fall back to defaults silently
+            break
+    return defaults
+
+
+UI_SETTINGS = _load_ui_settings()
 
 
 class CompanySelector(QDialog):
@@ -484,6 +553,14 @@ class ScanPage(QWidget):
         self.scan_btn.clicked.connect(self.start_scan)  # type: ignore[arg-type]
         layout.addLayout(folder_row)
         layout.addWidget(self.scan_btn)
+        # スキャン進捗表示
+        stat_row = QHBoxLayout()
+        self.scan_status = QLabel("")
+        self.scan_prog = QProgressBar(); self.scan_prog.setVisible(False)
+        self.scan_prog.setTextVisible(False)
+        stat_row.addWidget(self.scan_status, 1)
+        stat_row.addWidget(self.scan_prog)
+        layout.addLayout(stat_row)
 
         import_btn = QPushButton("PDF取込")
         import_dir_btn = QPushButton("フォルダ取込")
@@ -520,14 +597,26 @@ class ScanPage(QWidget):
 
     def import_pdfs(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(self, "PDFを選択", str(Path.cwd()), "PDF Files (*.pdf)")
-        for f in files:
+        if not files:
+            return
+        prog = QProgressDialog("取り込み中...", "中止", 0, len(files), self)
+        prog.setWindowTitle("PDF取込 進捗")
+        prog.setAutoClose(True); prog.setAutoReset(True)
+        imported = 0
+        for i, f in enumerate(files):
             try:
                 with open(f, "rb") as fh:
                     files_ = {"file": (Path(f).name, fh, "application/pdf")}
                     data = {"company_name": self.company}
-                    requests.post(f"{API_URL}/documents/import", data=data, files=files_, timeout=60)
+                    r = requests.post(f"{API_URL}/documents/import", data=data, files=files_, timeout=60)
+                    if r.ok:
+                        imported += 1
             except Exception as e:
                 QMessageBox.warning(self, "取込失敗", f"{f}: {e}")
+            prog.setValue(i + 1)
+            prog.setLabelText(Path(f).name)
+            if prog.wasCanceled():
+                break
         # 自ページと自動仕訳ページの両方を更新
         self.refresh()
         try:
@@ -543,22 +632,36 @@ class ScanPage(QWidget):
             return
         base = Path(folder)
         files = [p for p in base.rglob("*.pdf")]
-        imported = False
-        for p in files:
+        if not files:
+            QMessageBox.information(self, "フォルダ取込", "PDFが見つかりませんでした")
+            return
+        prog = QProgressDialog("フォルダ取込中...", "中止", 0, len(files), self)
+        prog.setWindowTitle("フォルダ取込 進捗")
+        prog.setAutoClose(True); prog.setAutoReset(True)
+        imported = 0
+        for i, p in enumerate(files):
             try:
                 with open(p, "rb") as fh:
                     files_ = {"file": (p.name, fh, "application/pdf")}
                     data = {"company_name": self.company}
                     r = requests.post(f"{API_URL}/documents/import", data=data, files=files_, timeout=60)
                     if r.ok:
-                        imported = True
+                        imported += 1
             except Exception:
                 pass
+            prog.setValue(i + 1)
+            prog.setLabelText(p.name)
+            if prog.wasCanceled():
+                break
         self.refresh()
         try:
             win = self.window()
             if hasattr(win, 'review_page'):
                 win.review_page.refresh()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            self.scan_status.setText(f"フォルダ取込 完了: {imported} 件")
         except Exception:
             pass
 
@@ -591,6 +694,11 @@ class ScanPage(QWidget):
         self._poll_timer.timeout.connect(self._poll_folder)  # type: ignore[arg-type]
         self._poll_deadline = time.time() + 120
         self._poll_timer.start(1000)
+        # 進捗UI
+        self.scan_status.setText("スキャン待機中...（最大120秒）")
+        self.scan_prog.setVisible(True)
+        self.scan_prog.setRange(0, 0)  # 不確定バー
+        self._import_count = 0
 
     def _poll_folder(self) -> None:
         folder = Path(self.watch_folder.text())
@@ -621,11 +729,21 @@ class ScanPage(QWidget):
                     win.review_page.refresh()  # type: ignore[attr-defined]
             except Exception:
                 pass
+            try:
+                self._import_count += 1
+                self.scan_status.setText(f"スキャン取り込み中... {self._import_count} 件")
+            except Exception:
+                pass
         if time.time() > getattr(self, "_poll_deadline", 0.0):
             if getattr(self, "_poll_timer", None):
                 self._poll_timer.stop()
                 self._poll_timer = None
             self.scan_btn.setEnabled(True)
+            try:
+                self.scan_prog.setVisible(False)
+                self.scan_status.setText(f"スキャン完了: {getattr(self, '_import_count', 0)} 件")
+            except Exception:
+                pass
 
 
 class ReviewPage(QWidget):
@@ -636,17 +754,37 @@ class ReviewPage(QWidget):
 
         # Left: PDF preview + NL instruction
         left = QVBoxLayout()
+        # Keep a reference for spacing/margins in sizing logic
+        self._left_layout = left
         self.pdf_label = QLabel("PDFプレビュー")
         # 固定幅の表示枠を確保して、ページ移動でレイアウトが揺れないようにする
-        self.pdf_label.setMinimumWidth(420)
+        try:
+            self.pdf_label.setMinimumWidth(int(UI_SETTINGS.get("pdf_label_min_width", 420)))
+            maxw = int(UI_SETTINGS.get("pdf_label_max_width", 0))
+            if maxw and maxw > 0:
+                self.pdf_label.setMaximumWidth(maxw)
+        except Exception:
+            self.pdf_label.setMinimumWidth(420)
         self.pdf_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pdf_label.setStyleSheet("border:1px solid #ccc; background:white;")
-        # 以降のスケーリングはこの固定幅を基準に行う
-        self._pdf_fixed_width = 420
+        # 横方向にしっかり広がるようにする
+        try:
+            self.pdf_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        except Exception:
+            pass
+        # 以降のスケーリングは設定値を基準に行う
+        self._pdf_fixed_width = int(UI_SETTINGS.get("pdf_fixed_width", 420))
+        self._pdf_scale_ratio = float(UI_SETTINGS.get("pdf_scale_ratio", 1.25))
         left.addWidget(self.pdf_label, 3)
 
         nl_group = QGroupBox("自然言語の指示（修正/仕訳）")
-        nl_group.setMinimumHeight(60)
+        try:
+            nl_group.setMinimumHeight(int(UI_SETTINGS.get("nl_group_min_height", 60)))
+            m = int(UI_SETTINGS.get("nl_group_max_height", 0))
+            if m and m > 0:
+                nl_group.setMaximumHeight(m)
+        except Exception:
+            pass
         nlg = QHBoxLayout()
         self.nl_edit = QTextEdit()
         # 明示的に編集可能にする（フォーカスも有効化）
@@ -663,7 +801,13 @@ class ReviewPage(QWidget):
             self.nl_edit.setWordWrapMode(QTextOption.WrapMode.WordWrap)
         except Exception:
             pass
-        self.nl_edit.setMinimumHeight(72)
+        try:
+            self.nl_edit.setMinimumHeight(int(UI_SETTINGS.get("nl_edit_min_height", 72)))
+            mx = int(UI_SETTINGS.get("nl_edit_max_height", 0))
+            if mx and mx > 0:
+                self.nl_edit.setMaximumHeight(mx)
+        except Exception:
+            self.nl_edit.setMinimumHeight(72)
         try:
             self.nl_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         except Exception:
@@ -673,19 +817,38 @@ class ReviewPage(QWidget):
         nlg.addWidget(self.nl_edit)
         nlg.addWidget(nl_btn)
         nl_group.setLayout(nlg)
-        try:
-            nl_group.setEnabled(True)
-        except Exception:
-            pass
+        # 後段の高さ計算で参照できるように保持
+        self.nl_group = nl_group
         left.addWidget(nl_group, 1)
 
         # 左ペインはスクロール可能にして、全画面やタスクバーで高さが圧迫されても
         # 下部の自然言語入力欄が隠れないようにする
         left_container = QWidget(); left_container.setLayout(left)
+        # 左ペインが極端に潰れないよう下限を持たせる
+        try:
+            left_container.setMinimumWidth(int(UI_SETTINGS.get("left_container_min_width", 500)))
+            mx = int(UI_SETTINGS.get("left_container_max_width", 0))
+            if mx and mx > 0:
+                left_container.setMaximumWidth(mx)
+        except Exception:
+            pass
         left_scroll = QScrollArea(); left_scroll.setWidgetResizable(True)
         left_scroll.setWidget(left_container)
         try:
+            left_scroll.setMinimumWidth(int(UI_SETTINGS.get("left_scroll_min_width", 480)))
+            mx = int(UI_SETTINGS.get("left_scroll_max_width", 0))
+            if mx and mx > 0:
+                left_scroll.setMaximumWidth(mx)
+        except Exception:
+            pass
+        try:
             left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        except Exception:
+            pass
+        # ビューポートのリサイズに追従してPDFのスケールを調整
+        try:
+            left_scroll.viewport().installEventFilter(self)
         except Exception:
             pass
 
@@ -771,9 +934,28 @@ class ReviewPage(QWidget):
             pass
         splitter.addWidget(left_scroll)
         splitter.addWidget(right_wrap)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
+        try:
+            splitter.setStretchFactor(0, int(UI_SETTINGS.get("splitter_stretch_left", 3)))
+            splitter.setStretchFactor(1, int(UI_SETTINGS.get("splitter_stretch_right", 4)))
+        except Exception:
+            splitter.setStretchFactor(0, 3)
+            splitter.setStretchFactor(1, 4)
         layout.addWidget(splitter)
+        # 初期割り当てを左を1.2倍広くする
+        self._splitter = splitter
+        # Keep left width stable on window resizes if fixed policy is set
+        try:
+            splitter.splitterMoved.connect(lambda pos, idx: self._apply_splitter_policy())  # type: ignore[arg-type]
+            self.installEventFilter(self)
+        except Exception:
+            pass
+        try:
+            from PyQt6.QtCore import QTimer
+            def _boost_left():
+                self._apply_splitter_policy()
+            QTimer.singleShot(0, _boost_left)
+        except Exception:
+            pass
 
         # 旧・単票入力フォームと左リストは廃止。
         # 以降は上部のジャーナル表で一括表示・編集・保存します。
@@ -782,6 +964,76 @@ class ReviewPage(QWidget):
         self._load_unconfirmed()
 
         self.refresh()
+
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        try:
+            from PyQt6.QtCore import QEvent
+            et = event.type()
+            if et in (QEvent.Type.Resize, QEvent.Type.LayoutRequest):
+                self._apply_splitter_policy()
+                # 左側ビューポートのリサイズ時はPDFスケールも追従
+                try:
+                    from PyQt6.QtWidgets import QScrollArea
+                    if isinstance(obj, QScrollArea) or getattr(obj, 'objectName', lambda: '')() == 'qt_scrollarea_viewport':
+                        if getattr(self, '_pdf_path', None):
+                            self._show_pdf(getattr(self, '_pdf_path'))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def _apply_splitter_policy(self) -> None:
+        try:
+            sizes = self._splitter.sizes()
+            if len(sizes) < 2:
+                return
+            total = sum(sizes) if sum(sizes) > 0 else max(1, self._splitter.width())
+            # Apply only when maximized if requested
+            try:
+                only_on_max = bool(UI_SETTINGS.get("apply_splitter_only_when_maximized", False))
+            except Exception:
+                only_on_max = False
+            if only_on_max:
+                try:
+                    win = self.window()
+                    if hasattr(win, 'isMaximized') and not win.isMaximized():  # type: ignore[attr-defined]
+                        return
+                except Exception:
+                    pass
+            # 設定: 左の最小/最大(px, 比率)
+            min_left = int(UI_SETTINGS.get("splitter_min_left_px", 560))
+            ratio = float(UI_SETTINGS.get("splitter_left_ratio", 0.35))
+            rratio = float(UI_SETTINGS.get("splitter_right_ratio", 0.0))
+            # If right ratio is specified (including 1.0), honor it and compute left from it
+            if rratio > 0.0:
+                rratio = max(0.0, min(1.0, rratio))
+                ratio = max(0.0, min(1.0, 1.0 - rratio))
+            # If left ratio is negative, treat as 'ignore' and rely on right ratio / fixed_px
+            if ratio < 0.0:
+                ratio = 0.0
+            max_left_px = int(UI_SETTINGS.get("splitter_max_left_px", 0))
+            max_ratio = float(UI_SETTINGS.get("splitter_left_max_ratio", 1.0))
+            fixed_px = int(UI_SETTINGS.get("splitter_left_fixed_px", 0))
+            fixed_ratio = float(UI_SETTINGS.get("splitter_left_fixed_ratio", 0.0))
+            if fixed_px and fixed_px > 0:
+                requested = fixed_px
+            elif 0.0 < fixed_ratio < 1.0:
+                requested = int(total * fixed_ratio)
+            else:
+                requested = max(min_left, int(total * ratio))
+            lmin_ratio = float(UI_SETTINGS.get("splitter_left_min_ratio", 0.0))
+            if 0.0 < lmin_ratio < 1.0:
+                requested = max(requested, int(total * lmin_ratio))
+            if max_left_px and max_left_px > 0:
+                requested = min(requested, max_left_px)
+            if 0 < max_ratio <= 1.0:
+                requested = min(requested, int(total * max_ratio))
+            left = min(total - 1, max(1, requested))
+            right = max(1, total - left)
+            self._splitter.setSizes([left, right])
+        except Exception:
+            pass
 
     def _populate_from_accounts(self) -> None:
         try:
@@ -1107,13 +1359,81 @@ class ReviewPage(QWidget):
             fmt = QImage.Format.Format_RGBA8888 if getattr(pix, 'alpha', False) else QImage.Format.Format_RGB888
             img = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
             pm = QPixmap.fromImage(img)
-            # 固定幅にスケールして、枠サイズを変えない
+            # ビューポート幅×倍率(既定1.25)を狙いつつ、縦スクロールが出ないよう高さ制約も反映
             try:
-                base_w = int(getattr(self, "_pdf_fixed_width", 420))
+                vp = None
+                # 直近で作ったスクロールを検索
+                p = self.pdf_label.parent()
+                while p is not None and not isinstance(p, QScrollArea):
+                    p = p.parent()
+                if isinstance(p, QScrollArea):
+                    vp = p.viewport()
+                avail_w = vp.width() if vp is not None else self.pdf_label.width()
+                avail_h = vp.height() if vp is not None else self.pdf_label.height()
             except Exception:
-                base_w = 420
-            w = max(320, base_w)
-            pm = pm.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
+                avail_w = self.pdf_label.width()
+                avail_h = self.pdf_label.height()
+            try:
+                ratio = float(getattr(self, "_pdf_scale_ratio", 1.25))
+                # 設定による下限/上限
+                rmin = float(UI_SETTINGS.get("pdf_scale_ratio_min", 0.0))
+                rmax = float(UI_SETTINGS.get("pdf_scale_ratio_max", 0.0))
+                if rmin:
+                    ratio = max(rmin, ratio)
+                if rmax:
+                    ratio = min(rmax, ratio)
+            except Exception:
+                ratio = 1.25
+            # 希望倍率(1.25)を優先しつつ、ビューポート幅の98%を上限にして横スクロールを回避
+            fixed_min = getattr(self, "_pdf_fixed_width", 420)
+            desired_w = int(avail_w * ratio)
+            max_w_by_width = int(avail_w * 0.98)
+            # 縦方向の制約: NL入力欄の必要高さを差し引いたPDF許容高さを計算
+            try:
+                nl_h = int(self.nl_group.sizeHint().height()) if hasattr(self, 'nl_group') else 0
+            except Exception:
+                nl_h = 0
+            # レイアウトのマージンとスペーシングも考慮して、縦スクロールが出ないように余白を差し引く
+            extra = 16
+            try:
+                left_layout = getattr(self, "_left_layout", None)
+                if left_layout is not None:
+                    m = left_layout.contentsMargins()
+                    extra += int(m.top()) + int(m.bottom()) + int(left_layout.spacing() or 0)
+            except Exception:
+                pass
+            try:
+                reserve = int(UI_SETTINGS.get("nl_reserved_height_px", 0))
+            except Exception:
+                reserve = 0
+            reserve = max(reserve, nl_h)
+            allowed_h = max(200, avail_h - reserve - extra)
+            # ピクセルから高さ基準の最大幅を算出（アスペクト比維持）
+            try:
+                max_w_by_height = int(pm.width() * (allowed_h / max(1, pm.height())))
+            except Exception:
+                max_w_by_height = max_w_by_width
+            hard_max_w = max(100, min(max_w_by_width, max_w_by_height))
+            # 追加の上限（絶対px）
+            try:
+                max_px = int(UI_SETTINGS.get("pdf_max_width_px", 0))
+                if max_px and max_px > 0:
+                    hard_max_w = min(hard_max_w, max_px)
+            except Exception:
+                pass
+            target = int(max(fixed_min, min(desired_w, hard_max_w)))
+            w = max(320, target)
+            # 高さの上限に確実に収めるため、幅と高さの両方を指定したスケールを用いる
+            try:
+                from PyQt6.QtCore import Qt as _Qt
+                pm = pm.scaled(w, int(allowed_h), _Qt.AspectRatioMode.KeepAspectRatio, _Qt.TransformationMode.SmoothTransformation)
+            except Exception:
+                pm = pm.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
+            # ラベル自体の高さ上限も設定して、NL欄が初期から見えるようにする
+            try:
+                self.pdf_label.setMaximumHeight(int(allowed_h))
+            except Exception:
+                pass
             self.pdf_label.setPixmap(pm)
             # Update intra-PDF page position label (keep doc navigation label separate)
             try:
@@ -1146,6 +1466,17 @@ class ReviewPage(QWidget):
             self._show_pdf(self._pdf_path)
         except Exception:
             pass
+
+    # ビューポート/ウィンドウのリサイズでプレビューを再スケール
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        try:
+            from PyQt6.QtCore import QEvent
+            if event.type() in (QEvent.Type.Resize,):
+                if getattr(self, "_pdf_path", None):
+                    self._show_pdf(self._pdf_path)
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
 
     def _apply_tax_combo(self) -> None:
         # apply selected tax category display name to table second row tax cell
