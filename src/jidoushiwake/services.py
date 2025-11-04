@@ -148,11 +148,11 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
             with temporary_config(cfg):
                 # Feed YOMITOKU first (if available) in the image OCR slot to prioritize it.
                 _pdf_for_llm = texts.get("text_pdf") or ""
-                _img_for_llm = ( (texts.get("text_yomitoku") or "") + "\n\n" + (texts.get("text_paddle") or "") ).strip()
+                _img_for_llm = (texts.get("text_yomitoku") or "").strip()
                 llm_ref = refine_extraction(_pdf_for_llm, _img_for_llm)
         else:
             _pdf_for_llm = texts.get("text_pdf") or ""
-            _img_for_llm = ( (texts.get("text_yomitoku") or "") + "\n\n" + (texts.get("text_paddle") or "") ).strip()
+            _img_for_llm = (texts.get("text_yomitoku") or "").strip()
             llm_ref = refine_extraction(_pdf_for_llm, _img_for_llm)
         if llm_ref:
             parsed.date = llm_ref.get("date") or parsed.date
@@ -224,9 +224,23 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
                 credit = km.credit_account
             applied_score += km.weight
 
-    # Detect qualified invoice registration number (T + 13 digits)
+    # Detect qualified invoice registration number (T + 13 digits) and simple tax hints
     import re as _re
-    inv_status = "適格" if _re.search(r"T\d{13}", text_combined) else None
+    inv_status = None
+    if _re.search(r"T\d{13}", text_combined):
+        inv_status = "適格"
+    else:
+        # If clearly an invoice/receipt but no T number, mark as 非適格（暫定）
+        if _re.search(r"(領収書|請求書|領収|請求)", text_combined):
+            inv_status = "非適格"
+    # Tax rate hints (lightweight)
+    t_lower = (text_combined or "").lower()
+    if any(k in t_lower for k in ("非課税", "不課税", "対象外")):
+        inv_status = "非課税"
+    elif any(k in t_lower for k in ("軽減", "8%", "８％", "8％")):
+        inv_status = "軽減8%"
+    elif any(k in t_lower for k in ("10%", "１０％", "10％")):
+        inv_status = inv_status or "課税10%"
 
     auto = AutoResult(
         document_id=doc.id,

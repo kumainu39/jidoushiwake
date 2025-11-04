@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
 import re
@@ -13,6 +13,7 @@ import json
 
 LOGGER = logging.getLogger(__name__)
 
+from .yomitoku_ocr import extract_text_with_yomitoku
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
     LOGGER.info("Extracting text from PDF: %s", pdf_path)
@@ -111,157 +112,42 @@ def _extract_text_with_paddle(pdf_path: Path) -> str:
     return "\n".join(texts)
 
 
-def _extract_text_with_yomitoku(pdf_path: Path) -> str:
-    """OCR via YOMITOKU.
-
-    1) Prefer Python library (if installed).
-    2) Fallback to CLI `yomitoku` if available.
-    Returns empty string on failure.
-    """
-    # 1) Try library first (best-effort: support a few common APIs)
-    try:
-        # Attempt import patterns
-        try:
-            import yomitoku as _yomi  # type: ignore
-        except Exception:
-            _yomi = None  # type: ignore
-        if _yomi is not None:
-            text: str | None = None
-            # Common patterns: extract_text(path) or convert(path) -> str
-            for attr in ("extract_text", "convert", "to_text", "extract"):
-                func = getattr(_yomi, attr, None)
-                if callable(func):
-                    try:
-                        text = func(str(pdf_path))  # type: ignore[misc]
-                        if isinstance(text, str) and text.strip():
-                            return text
-                    except Exception:
-                        pass
-            # Some libs expose module .api with similar functions
-            api = getattr(_yomi, "api", None)
-            if api is not None:
-                for attr in ("extract_text", "convert", "to_text"):
-                    func = getattr(api, attr, None)
-                    if callable(func):
-                        try:
-                            text = func(str(pdf_path))  # type: ignore[misc]
-                            if isinstance(text, str) and text.strip():
-                                return text
-                        except Exception:
-                            pass
-    except Exception:
-        # Ignore and continue to CLI fallback
-        pass
-
-    # 2) CLI fallback
-    try:
-        import shutil
-        import subprocess
-        import tempfile
-        import sys
-    except Exception:
-        return ""
-
-    def _resolve_yomitoku_exe() -> Optional[str]:
-        # 1) PATH
-        p = shutil.which("yomitoku")
-        if p:
-            return p
-        # 2) Same directory as current Python (useful when running from venv)
-        try:
-            here = Path(sys.executable).parent
-            for name in ("yomitoku.exe", "yomitoku"):
-                cand = here / name
-                if cand.exists():
-                    return str(cand)
-        except Exception:
-            pass
-        # 3) Common local venv folders relative to CWD
-        for rel in (".venv/Scripts/yomitoku.exe", ".venv/bin/yomitoku", "venv/Scripts/yomitoku.exe", "venv/bin/yomitoku"):
-            cand = Path.cwd() / rel
-            if cand.exists():
-                return str(cand)
-        # 4) Environment override
-        env_p = os.getenv("YOMITOKU_EXE")
-        if env_p and Path(env_p).exists():
-            return env_p
-        return None
-
-    _yomi_exe = _resolve_yomitoku_exe()
-    if not _yomi_exe:
-        LOGGER.info("yomitoku CLI not found in PATH or local venv; skipping YOMITOKU OCR")
-        return ""
-
-    try:
-        # Mirror the behavior of the provided sample (test2.py):
-        # write results next to the PDF under a fixed folder name so users can inspect them.
-        base_dir = pdf_path.parent
-        out_dir = base_dir / "yomitoku_output"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        fmt = os.getenv("YOMITOKU_FORMAT", "md")
-        cmd = [
-            _yomi_exe,
-            str(pdf_path),
-            "-f", fmt,
-            "--combine",
-            "--encoding", "utf-8",
-            "-o", str(out_dir),
-        ]
-        try:
-            subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            return ""
-
-        collected: list[str] = []
-        # Prefer combined .md, then other text formats
-        patterns = ["**/*.md", "**/*.txt", "**/*.json", "**/*.*"]
-        for pat in patterns:
-            for f in sorted(out_dir.glob(pat)):
-                if f.is_dir():
-                    continue
-                try:
-                    txt = f.read_text(encoding="utf-8", errors="ignore")
-                    if txt and txt.strip():
-                        collected.append(txt)
-                except Exception:
-                    continue
-            if collected:
-                break
-        return "\n\n".join(collected)
-    except Exception:
-        return ""
+# YOMITOKU OCR is now provided by a dedicated module for maintainability.
 
 
 def extract_text_both(pdf_path: Path) -> dict:
-    """Extract text via embedded text layer, YOMITOKU, and PaddleOCR.
+    """Extract text via embedded text layer and YOMITOKU (PaddleOCR removed).
 
-    Returns a dict with keys: text_pdf, text_yomitoku, text_paddle, text_combined.
+    Returns a dict with keys: text_pdf, text_yomitoku, text_combined.
+
+    text_combined always uses YOMITOKU output (hard requirement).
     """
+    LOGGER.info("[OCR] begin extract_text_both: %s", pdf_path)
     t_pdf = extract_text_from_pdf(pdf_path)
-    t_yomi = _extract_text_with_yomitoku(pdf_path)
-    t_paddle = _extract_text_with_paddle(pdf_path)
+    LOGGER.info("[OCR] pdfminer/PyPDF2 extracted: %d chars", len(t_pdf or ""))
+    t_yomi = extract_text_with_yomitoku(pdf_path, ensure=True)
+    LOGGER.info("[OCR] YOMITOKU extracted: %d chars", len(t_yomi or ""))
+    # Enforce YOMITOKU usage: if unavailable or empty, treat as fatal
+    if not (t_yomi and t_yomi.strip()):
+        raise RuntimeError(
+            "YOMITOKU OCR is required but not available or produced no text. "
+            "Install and ensure 'yomitoku' CLI (or Python package) works. "
+            "You can set YOMITOKU_EXE to the CLI path."
+        )
+    # PaddleOCR usage removed by request
+    t_paddle = ""
 
-    # Combine heuristically: merge unique lines preserving order preference to PDF text
-    seen = set()
-    combined_lines: list[str] = []
-    # Prefer YOMITOKU > PDF layer > PaddleOCR
-    for part in (t_yomi, t_pdf, t_paddle):
-        for ln in (part or "").splitlines():
-            s = ln.strip()
-            if not s:
-                continue
-            key = s
-            if key in seen:
-                continue
-            seen.add(key)
-            combined_lines.append(s)
+    # Prefer a single-source combined text: YOMITOKU > PDF > Paddle
+    # Always use YOMITOKU output for combined text (hard requirement)
+    t_combined = t_yomi
 
-    return {
+    result = {
         "text_pdf": t_pdf,
         "text_yomitoku": t_yomi,
-        "text_paddle": t_paddle,
-        "text_combined": "\n".join(combined_lines),
+        "text_combined": t_combined,
     }
+    LOGGER.info("[OCR] combined length: %d", len(t_combined or ""))
+    return result
 
 
 @dataclass
@@ -282,15 +168,14 @@ DATE_PATTERNS = [
 # Accept half-width and full-width digits/symbols. We normalize before parsing, but
 # keep a permissive regex as well to catch mixed strings.
 YEN_AMOUNT_PATTERNS = [
-    # Optional sign, optional Yen symbol, number (1,234 or 1234), optional 円
-    re.compile(r"([\-−]?)\s*[¥￥]?\s*([0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[0-9０-９]+)\s*(?:円)?"),
+    # Optional sign, optional Yen symbol, number (1,234 or 1234), optional 蜀・    re.compile(r"([\-竏綻?)\s*[ﾂ･・･]?\s*([0-9・・・兢{1,3}(?:[,・珪[0-9・・・兢{3})+|[0-9・・・兢+)\s*(?:蜀・?"),
 ]
 
 # Translation table for full-width to half-width digits and punctuation used in amounts
 _FW_TO_HW = str.maketrans({
-    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
-    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
-    "，": ",", "．": ".", "￥": "¥", "－": "-", "―": "-", "ー": "-",
+    "・・: "0", "・・: "1", "・・: "2", "・・: "3", "・・: "4",
+    "・・: "5", "・・: "6", "・・: "7", "・・: "8", "・・: "9",
+    "・・: ",", "・・: ".", "・･": "ﾂ･", "・・: "-", "窶・: "-", "繝ｼ": "-",
 })
 
 def _normalize_amount_text(s: str) -> str:
@@ -298,7 +183,7 @@ def _normalize_amount_text(s: str) -> str:
     s = s.translate(_FW_TO_HW)
     # Replace unusual thin/non-breaking spaces if present
     s = s.replace("\u2009", " ").replace("\u00A0", " ")
-    # Some OCR introduces spaces between digits: "8 0 0" → "800"
+    # Some OCR introduces spaces between digits: "8 0 0" 竊・"800"
     s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
     return s
 
@@ -328,7 +213,7 @@ def _parse_int_amount(s: str, sign: str = "") -> int:
     s = s.replace(",", "")
     try:
         val = int(s)
-        return -val if sign in ("-", "−") else val
+        return -val if sign in ("-", "竏・) else val
     except ValueError:
         return 0
 
@@ -340,7 +225,7 @@ def _find_amount(text: str) -> Optional[int]:
         lowered = line.lower()
         norm_line = _normalize_amount_text(line)
         weight = 1
-        if any(k in lowered for k in ("合計", "計", "金額", "精算", "請求額", "税込", "支払")) or ("円" in line or "¥" in line or "￥" in line):
+        if any(k in lowered for k in ("蜷郁ｨ・, "險・, "驥鷹｡・, "邊ｾ邂・, "隲区ｱる｡・, "遞手ｾｼ", "謾ｯ謇・)) or ("蜀・ in line or "ﾂ･" in line or "・･" in line):
             weight = 3
         for pat in YEN_AMOUNT_PATTERNS:
             for m in pat.finditer(norm_line):
@@ -360,44 +245,44 @@ def _find_amount(text: str) -> Optional[int]:
 
 
 VENDOR_KEYWORDS = {
-    "amazon": "消耗品費",
-    "アマゾン": "消耗品費",
-    "楽天": "消耗品費",
-    "ヤマト": "荷造運賃",
-    "佐川": "荷造運賃",
-    "ゆうパック": "荷造運賃",
-    "郵便": "通信費",
-    "切手": "通信費",
-    "タクシー": "旅費交通費",
-    "uber": "旅費交通費",
-    "jr": "旅費交通費",
-    "電車": "旅費交通費",
-    "ガソリン": "車両費",
-    "eneos": "車両費",
-    "出前館": "会議費",
-    "ウーバーイーツ": "会議費",
-    "マクドナルド": "会議費",
-    "スターバックス": "交際費",
+    "amazon": "豸郁怜刀雋ｻ",
+    "繧｢繝槭だ繝ｳ": "豸郁怜刀雋ｻ",
+    "讌ｽ螟ｩ": "豸郁怜刀雋ｻ",
+    "繝､繝槭ヨ": "闕ｷ騾驕玖ｳ・,
+    "菴仙ｷ・: "闕ｷ騾驕玖ｳ・,
+    "繧・≧繝代ャ繧ｯ": "闕ｷ騾驕玖ｳ・,
+    "驛ｵ萓ｿ": "騾壻ｿ｡雋ｻ",
+    "蛻・焔": "騾壻ｿ｡雋ｻ",
+    "繧ｿ繧ｯ繧ｷ繝ｼ": "譌・ｲｻ莠､騾夊ｲｻ",
+    "uber": "譌・ｲｻ莠､騾夊ｲｻ",
+    "jr": "譌・ｲｻ莠､騾夊ｲｻ",
+    "髮ｻ霆・: "譌・ｲｻ莠､騾夊ｲｻ",
+    "繧ｬ繧ｽ繝ｪ繝ｳ": "霆贋ｸ｡雋ｻ",
+    "eneos": "霆贋ｸ｡雋ｻ",
+    "蜃ｺ蜑埼､ｨ": "莨夊ｭｰ雋ｻ",
+    "繧ｦ繝ｼ繝舌・繧､繝ｼ繝・: "莨夊ｭｰ雋ｻ",
+    "繝槭け繝峨リ繝ｫ繝・: "莨夊ｭｰ雋ｻ",
+    "繧ｹ繧ｿ繝ｼ繝舌ャ繧ｯ繧ｹ": "莠､髫幄ｲｻ",
 }
 
 PAYMENT_KEYWORDS = {
-    "クレジット": "未払金",
-    "visa": "未払金",
-    "mastercard": "未払金",
-    "jcb": "未払金",
-    "amex": "未払金",
-    "paypay": "未払金",
-    "line pay": "未払金",
-    "楽天ペイ": "未払金",
-    "請求書": "未払金",
-    "振込": "普通預金",
-    "振替": "普通預金",
-    "入金": "普通預金",
-    "引落": "普通預金",
-    "現金": "現金",
-    "レジ": "現金",
-    "atm": "普通預金",
-    "銀行": "普通預金",
+    "繧ｯ繝ｬ繧ｸ繝・ヨ": "譛ｪ謇暮≡",
+    "visa": "譛ｪ謇暮≡",
+    "mastercard": "譛ｪ謇暮≡",
+    "jcb": "譛ｪ謇暮≡",
+    "amex": "譛ｪ謇暮≡",
+    "paypay": "譛ｪ謇暮≡",
+    "line pay": "譛ｪ謇暮≡",
+    "讌ｽ螟ｩ繝壹う": "譛ｪ謇暮≡",
+    "隲区ｱよ嶌": "譛ｪ謇暮≡",
+    "謖ｯ霎ｼ": "譎ｮ騾夐宣≡",
+    "謖ｯ譖ｿ": "譎ｮ騾夐宣≡",
+    "蜈･驥・: "譎ｮ騾夐宣≡",
+    "蠑戊誠": "譎ｮ騾夐宣≡",
+    "迴ｾ驥・: "迴ｾ驥・,
+    "繝ｬ繧ｸ": "迴ｾ驥・,
+    "atm": "譎ｮ騾夐宣≡",
+    "驫陦・: "譎ｮ騾夐宣≡",
 }
 
 
@@ -408,14 +293,14 @@ def _guess_accounts(text: str) -> Tuple[str, str]:
             debit = acc
             break
     else:
-        debit = "雑費"
+        debit = "髮題ｲｻ"
 
     for kw, acc in PAYMENT_KEYWORDS.items():
         if kw in t:
             credit = acc
             break
     else:
-        credit = "未払金"
+        credit = "譛ｪ謇暮≡"
     return debit, credit
 
 
@@ -426,8 +311,8 @@ def _extract_counterparty(text: str) -> str:
     for ln in head:
         if len(ln) < 3:
             continue
-        if re.search(r"[A-Za-zァ-ンｧ-ﾝﾞﾟ一-龥]{2,}", ln):
-            if any(k in ln for k in ("領収", "請求", "合計", "金額", "明細", "内訳")):
+        if re.search(r"[A-Za-z繧｡-繝ｳ・ｧ-・晢ｾ橸ｾ滉ｸ-鮴･]{2,}", ln):
+            if any(k in ln for k in ("鬆伜庶", "隲区ｱ・, "蜷郁ｨ・, "驥鷹｡・, "譏守ｴｰ", "蜀・ｨｳ")):
                 continue
             best = ln
             break
@@ -435,12 +320,12 @@ def _extract_counterparty(text: str) -> str:
 
 
 def extract_journal_data(text: str) -> ParsedJournal:
-    date = _find_date(text)
-    amount = _find_amount(text)
+    date = _find_date_smart(text)
+    amount = _find_amount_smart(text)
     debit, credit = _guess_accounts(text)
-    counterparty = _extract_counterparty(text)
-    summary_parts = [p for p in [counterparty or None, "購入"] if p]
-    summary = " ".join(summary_parts) if summary_parts else "支払"
+    counterparty = _extract_counterparty_smart(text)
+    summary_parts = [p for p in [counterparty or None, "雉ｼ蜈･"] if p]
+    summary = " ".join(summary_parts) if summary_parts else "謾ｯ謇・
     return ParsedJournal(
         date=date,
         amount=amount,
@@ -449,3 +334,85 @@ def extract_journal_data(text: str) -> ParsedJournal:
         credit_account=credit,
         counterparty=counterparty,
     )
+
+
+# Improved helpers: smarter date/amount/counterparty detection
+def _find_date_smart(text: str) -> Optional[str]:
+    try:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        labeled = [
+            re.compile(r"(逋ｺ陦梧律|縺碑ｫ区ｱよ律|隲区ｱよ律|縺泌茜逕ｨ譌･|蛻ｩ逕ｨ譌･|雉ｼ蜈･譌･|縺願ｲｷ荳頑律|鬆伜庶譌･|蜿門ｼ墓律|豕ｨ譁・律|邏榊刀譌･|譌･莉・[:・咯?\s*(\d{4})[\./蟷ｴ・十-](\d{1,2})[\./譛茨ｼ十-](\d{1,2})譌･?"),
+            re.compile(r"(逋ｺ陦梧律|縺碑ｫ区ｱよ律|隲区ｱよ律|縺泌茜逕ｨ譌･|蛻ｩ逕ｨ譌･|雉ｼ蜈･譌･|縺願ｲｷ荳頑律|鬆伜庶譌･|蜿門ｼ墓律|豕ｨ譁・律|邏榊刀譌･|譌･莉・[:・咯?\s*(\d{4})(\d{2})(\d{2})"),
+        ]
+        for ln in lines:
+            for pat in labeled:
+                m = pat.search(ln)
+                if m and len(m.groups()) >= 4:
+                    y, mm, dd = m.group(2), m.group(3), m.group(4)
+                    d = _norm_date(y, mm, dd)
+                    if d:
+                        return d
+        ignore = ("繧ｹ繧ｭ繝｣繝ｳ", "ScanSnap", "菴懈・", "逕滓・", "蜃ｺ蜉・, "蜊ｰ蛻ｷ", "菫晏ｭ・, "繧｢繝・・繝ｭ繝ｼ繝・, "download", "uploaded")
+        generic = [
+            re.compile(r"(20\d{2})[\-/\.](\d{1,2})[\-/\.](\d{1,2})"),
+            re.compile(r"(\d{4})(\d{2})(\d{2})"),
+        ]
+        for ln in lines:
+            low = ln.lower()
+            if any(k.lower() in low for k in ignore):
+                continue
+            for pat in generic:
+                m = pat.search(ln)
+                if m and len(m.groups()) == 3:
+                    y, mm, dd = m.groups()
+                    d = _norm_date(y, mm, dd)
+                    if d:
+                        return d
+    except Exception:
+        pass
+    return _find_date(text)
+
+
+def _find_amount_smart(text: str) -> Optional[int]:
+    try:
+        candidates: list[tuple[int, int]] = []
+        cues = ("蜷郁ｨ・, "蜷育ｮ・, "險・, "隲区ｱ・, "驥鷹｡・, "遞手ｾｼ", "遞取栢", "縺頑髪謇・, "縺碑ｫ区ｱ・, "縺皮ｲｾ邂・, "縺願ｲｷ荳・, "縺碑ｳｼ蜈･")
+        pat = re.compile(r"([\-竏綻?)\s*[ﾂ･\u00A5]?\s*([0-9]{1,3}(?:[,\s][0-9]{3})+|[0-9]+)\s*(?:蜀・?")
+        for line in text.splitlines():
+            norm = _normalize_amount_text(line)
+            weight = 1
+            if any(k in line for k in cues) or ("蜀・ in line) or ("ﾂ･" in line):
+                weight = 5
+            for m in pat.finditer(norm):
+                sign = m.group(1) or ""
+                num = m.group(2)
+                amount = _parse_int_amount(num, sign)
+                if amount == 0:
+                    continue
+                if weight < 5 and len(re.sub(r"\D", "", num)) > 6:
+                    continue
+                candidates.append((weight * abs(amount), amount))
+        if candidates:
+            return max(candidates, key=lambda t: t[0])[1]
+    except Exception:
+        pass
+    return _find_amount(text)
+
+
+def _extract_counterparty_smart(text: str) -> str:
+    try:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for ln in lines[:25]:
+            if len(ln) < 3:
+                continue
+            if ln.startswith("%PDF-") or ln.upper().startswith("PDF-"):
+                continue
+            if any(bad in ln for bad in ("YOMITOKU", "Adobe", "Image", "ScanSnap", "FUJITSU")):
+                continue
+            if re.search(r"[A-Za-z繧｡-繝ｳ荳-鮴･縲・・]{2,}", ln):
+                if any(k in ln for k in ("鬆伜庶", "隲区ｱ・, "蜷郁ｨ・, "驥鷹｡・, "譏守ｴｰ", "蜈･驥・, "蜃ｺ驥・)):
+                    continue
+                return ln[:64]
+    except Exception:
+        pass
+    return _extract_counterparty(text)

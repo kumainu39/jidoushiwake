@@ -39,6 +39,9 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QScrollArea,
 )
+from PyQt6.QtWidgets import QCompleter, QStyledItemDelegate, QStyleOptionViewItem, QStyle
+from PyQt6.QtCore import QSortFilterProxyModel
+from PyQt6.QtGui import QStandardItemModel, QStandardItem
 import requests
 import time
 from ..scansnap_control import reserve_and_scan
@@ -111,6 +114,1091 @@ def _load_ui_settings() -> dict:
 
 
 UI_SETTINGS = _load_ui_settings()
+
+
+def _clean_display_name(name: str) -> str | None:
+    """Return a cleaned Japanese account name or None to drop it.
+
+    Heuristics:
+    - Remove ASCII/number suffixes (romaji/codes appended to the right).
+    - Drop bracketed notes in ()/（） entirely.
+    - Exclude headings like "資産の部/負債の部/純資産の部" and lines that contain "の部".
+    - Exclude names that still contain ASCII letters/digits after cleanup.
+    - Require at least one Japanese character (Kana/Kanji) and length >= 2.
+    """
+    try:
+        import re
+        s = (name or "").strip()
+        if not s:
+            return None
+        # remove bracketed content
+        s = re.sub(r"[（(][^）)]*[）)]", "", s)
+        # cut off at first ASCII letter/number occurrence (and right side)
+        m = re.match(r"^([^A-Za-z0-9]+)", s)
+        if m:
+            s = m.group(1).strip()
+        # normalize spaces and punctuation
+        s = re.sub(r"\s+", "", s)
+        # headings like 資産の部/負債の部/純資産の部 などは除外
+        if "の部" in s:
+            return None
+        if any(k in s for k in ("合計", "小計")):
+            return None
+        # require Japanese chars
+        def has_jp(t: str) -> bool:
+            return any((0x3040 <= ord(ch) <= 0x30FF) or (0x3400 <= ord(ch) <= 0x9FFF) for ch in t)
+        if not has_jp(s):
+            return None
+        # exclude if ASCII/digits remain
+        if any(("A" <= ch <= "Z") or ("a" <= ch <= "z") or ch.isdigit() for ch in s):
+            return None
+        if len(s) < 2:
+            return None
+        return s
+    except Exception:
+        return name or None
+
+
+def _load_account_catalog() -> tuple[list[str], dict[str, str]]:
+    """Return (display_names, token_to_name).
+
+    - display_names: 科目名のみ（日本語）。コードやローマ字は除外。
+    - token_to_name: 検索用トークン（コード/ローマ字等）→ 表示名 へのマップ。
+    """
+    names: list[str] = []
+    token_to_name: dict[str, str] = {}
+    # API source
+    try:
+        r = requests.get(f"{API_URL}/admin/account_master", timeout=10)
+        if r.ok:
+            for row in r.json() or []:
+                raw_name = (row or {}).get("name")
+                code = (row or {}).get("code")
+                if raw_name:
+                    cn = _clean_display_name(str(raw_name))
+                    if cn:
+                        names.append(cn)
+                    if code:
+                        token_to_name[str(code)] = cn
+    except Exception:
+        pass
+    # Seed fallback
+    if not names:
+        try:
+            candidates = [
+                Path.cwd() / "data" / "account_master_seed.txt",
+                Path(__file__).resolve().parents[3] / "data" / "account_master_seed.txt",
+            ]
+        except Exception:
+            candidates = []
+        for sp in candidates:
+            try:
+                if not sp.is_file():
+                    continue
+                with sp.open("r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        raw = (line or "").strip()
+                        if not raw or raw.startswith("#"):
+                            continue
+                        # CSV優先: code,name,romaji1,...
+                        parts = [p.strip() for p in raw.split(",")]
+                        if len(parts) > 1:
+                            code, nm, *rest = parts
+                            clean = _clean_display_name(nm)
+                            if clean:
+                                names.append(clean)
+                                if code:
+                                    token_to_name[code] = clean
+                                for tok in rest:
+                                    tok = (tok or '').strip()
+                                    if tok:
+                                        token_to_name[tok] = clean
+                            continue
+                        # 非CSV（空白区切り）: 日本語名 [ROMAJI] [CODE]
+                        s = raw
+                        # exclude section/group headings early
+                        if "の部" in s:
+                            continue
+                        import re
+                        m = re.match(r"^([^\x00-\x7F]+)\s*(.*)$", s)
+                        if not m:
+                            # no clear Japanese prefix; fallback to cleaning whole
+                            nm = _clean_display_name(s)
+                            if nm:
+                                names.append(nm)
+                            continue
+                        jp, rest = m.group(1).strip(), m.group(2).strip()
+                        clean = _clean_display_name(jp)
+                        if not clean:
+                            continue
+                        toks: list[str] = []
+                        if rest:
+                            for w in re.split(r"\s+", rest):
+                                w = (w or '').strip()
+                                if not w:
+                                    continue
+                                # take ASCII tokens only
+                                if all(ord(c) < 128 for c in w):
+                                    toks.append(w)
+                        names.append(clean)
+                        for tok in toks:
+                            token_to_name[tok] = clean
+                if names:
+                    break
+            except Exception:
+                continue
+    # Final pass: keep only displayable Japanese names and clean again
+    def _is_displayable(s: str) -> bool:
+        return any((0x3040 <= ord(ch) <= 0x30FF) or (0x3400 <= ord(ch) <= 0x9FFF) for ch in s)
+    names = [(_clean_display_name(n) or "") for n in names]
+    names = [n for n in names if n and _is_displayable(n)]
+    # de-duplicate preserving order
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for n in names:
+        if n not in seen:
+            uniq.append(n)
+            seen.add(n)
+    for n in uniq:
+        token_to_name.setdefault(n, n)
+        token_to_name.setdefault(n.lower(), n)
+    # also index lowercase variants of provided tokens
+    token_to_name = { (k or "").strip(): v for k, v in token_to_name.items() if (k or "").strip() }
+    extra: dict[str, str] = {}
+    for k, v in token_to_name.items():
+        lk = k.lower()
+        if lk not in token_to_name:
+            extra[lk] = v
+    token_to_name.update(extra)
+    return uniq, token_to_name
+
+
+def _load_account_names() -> list[str]:
+    names, _ = _load_account_catalog()
+    return names
+
+
+class _AccountComboBox(QComboBox):
+    def __init__(self, items: list[str], token_to_name: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self._token_to_name = { (k or '').strip(): v for k, v in (token_to_name or {}).items() }
+        self._token_to_name_lower = { (k or '').strip().lower(): v for k, v in self._token_to_name.items() }
+        self._allow_index_change: bool = False
+        try:
+            self.setEditable(True)
+            # Avoid default auto-completion that replaces the text after a single keystroke
+            try:
+                self.setCompleter(None)
+            except Exception:
+                pass
+            try:
+                self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            # Use a custom model that displays names only in the combo,
+            # and a separate completer model that maps many tokens → the same name.
+            model = QStandardItemModel()  # combo's display model (name only)
+            names = list(items)
+            # Gather tokens per name
+            name_tokens: dict[str, set[str]] = {n: set() for n in names}
+            for tok, nm in self._token_to_name.items():
+                if not nm:
+                    continue
+                if nm not in name_tokens:
+                    continue
+                t = (tok or '').strip()
+                if not t:
+                    continue
+                # sanitize tokens: ASCII only, len>=2 for alpha, >=2 for digits（2文字から検索したい要望に対応）
+                if not all(ord(c) < 128 for c in t):
+                    continue
+                if t.isalpha() and len(t) < 2:
+                    continue
+                if t.isdigit() and len(t) < 2:
+                    continue
+                if len(t) < 2:
+                    continue
+                name_tokens[nm].add(t.lower())
+            # Build items with DisplayRole=name, UserRole=search_blob, UserRole+1=right token, UserRole+2=tokens(list)
+            from PyQt6.QtCore import Qt as _Qt
+            for nm in names:
+                it = QStandardItem(nm)
+                toks = sorted(name_tokens.get(nm, set()))
+                blob = ' '.join(toks + [nm.lower()])
+                it.setData(blob, _Qt.ItemDataRole.UserRole)
+                try:
+                    it.setData(toks, _Qt.ItemDataRole.UserRole + 2)
+                except Exception:
+                    pass
+                # choose representative token to render on the right (prefer alpha)
+                rep = next((x.upper() for x in toks if x.isalpha()), '') or next((x for x in toks if x.isdigit()), '')
+                it.setData(rep, _Qt.ItemDataRole.UserRole + 1)
+                model.appendRow(it)
+            # Install proxy filter so typing in the editor filters popup by tokens as well
+            class _Proxy(QSortFilterProxyModel):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self._query = ''
+                    self.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+                def setQuery(self, q: str) -> None:
+                    self._query = (q or '').strip()
+                    self.invalidateFilter()
+                def filterAcceptsRow(self, src_row: int, src_parent) -> bool:  # type: ignore[override]
+                    if not self._query:
+                        return True
+                    m = self.sourceModel()
+                    try:
+                        idx = m.index(src_row, 0, src_parent)
+                        name = (m.data(idx) or '').lower()
+                        blob = (m.data(idx, _Qt.ItemDataRole.UserRole) or '').lower()
+                        toks = m.data(idx, _Qt.ItemDataRole.UserRole + 2) or []
+                        q = self._query.lower()
+                        if q in name or q in blob:
+                            return True
+                        for t in toks:
+                            try:
+                                if q in (t or '').lower():
+                                    return True
+                            except Exception:
+                                continue
+                        return False
+                    except Exception:
+                        return True
+            proxy = _Proxy()
+            proxy.setSourceModel(model)
+            self.setModel(proxy)
+            # Prevent popup view from stealing focus while typing
+            try:
+                from PyQt6.QtCore import Qt as _Qt
+                self.view().setFocusPolicy(_Qt.FocusPolicy.NoFocus)
+            except Exception:
+                pass
+            # Filter as user types and keep popup open
+            try:
+                le = self.lineEdit()
+                if le is not None:
+                    # Ensure normal echo so typed characters are visible
+                    try:
+                        from PyQt6.QtWidgets import QLineEdit as _QLineEdit
+                        le.setEchoMode(_QLineEdit.EchoMode.Normal)
+                    except Exception:
+                        pass
+                    def _on_edit(txt: str) -> None:
+                        try:
+                            import unicodedata as _ud
+                            norm = _ud.normalize('NFKC', txt)
+                            proxy.setQuery(norm)
+                            if not self.view().isVisible():
+                                self.showPopup()
+                            try:
+                                from PyQt6.QtCore import Qt as _Qt
+                                le.setFocus(_Qt.FocusReason.OtherFocusReason)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                    le.textEdited.connect(_on_edit)  # type: ignore[arg-type]
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # Normalize when user finishes typing without selecting a completion
+        try:
+            le = self.lineEdit()
+            if le is not None:
+                try:
+                    le.editingFinished.connect(self._apply_normalization)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _apply_normalization(self) -> None:
+        try:
+            txt = (self.currentText() or "").strip()
+            mapped = self._best_map(txt)
+            if mapped != self.currentText():
+                self.setCurrentText(mapped)
+        except Exception:
+            pass
+
+    # Guard against implicit index changes while editing
+    def setCurrentIndex(self, index: int) -> None:  # type: ignore[override]
+        try:
+            le = self.lineEdit()
+            if le is not None and le.hasFocus() and not self._allow_index_change:
+                # Ignore implicit attempts to change index during typing
+                return
+        except Exception:
+            pass
+        try:
+            super().setCurrentIndex(index)
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        try:
+            from PyQt6.QtCore import QEvent
+            if obj is self.lineEdit():
+                if event.type() == QEvent.Type.FocusIn:
+                    self._allow_index_change = False
+                elif event.type() == QEvent.Type.FocusOut:
+                    # Allow index change on commit
+                    self._allow_index_change = True
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+
+class _AccountListDelegate(QStyledItemDelegate):
+    """Draws name left and token right; highlights typed substring in token."""
+
+    def __init__(self, owner: Optional[QComboBox] = None, parent: Optional[QWidget] = None) -> None:  # type: ignore[name-defined]
+        super().__init__(parent)
+        self._owner = owner
+
+    def paint(self, painter, option, index):  # type: ignore[override]
+        try:
+            from PyQt6.QtCore import Qt as _Qt
+            from PyQt6.QtGui import QFontMetrics, QPen, QPalette
+            # Clone style option and clear text to avoid default text draw (prevents重なり)
+            opt = QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            name = str(index.data() or "")
+            token = str(index.data(_Qt.ItemDataRole.UserRole + 1) or "")
+            opt.text = ""
+            style = opt.widget.style() if opt.widget else QApplication.style()
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+
+            # Compute rects for left name and right token
+            rect = opt.rect
+            metrics = QFontMetrics(opt.font)
+            token_w = metrics.horizontalAdvance(token) + (12 if token else 0)
+            name_rect = rect.adjusted(6, 0, -token_w, 0)
+            token_rect = rect.adjusted(rect.width() - token_w, 0, -6, 0)
+
+            painter.save()
+            painter.setPen(opt.palette.text().color())
+            painter.drawText(name_rect, _Qt.AlignmentFlag.AlignVCenter | _Qt.AlignmentFlag.AlignLeft, name)
+            if token:
+                # Determine query from owner lineEdit
+                try:
+                    import unicodedata as _ud
+                    q = ""
+                    if self._owner is not None and hasattr(self._owner, 'lineEdit'):
+                        le = self._owner.lineEdit()
+                        if le is not None:
+                            q = _ud.normalize('NFKC', le.text() or "").lower().strip()
+                    t_low = token.lower()
+                    pos = t_low.find(q) if q else -1
+                except Exception:
+                    q = ""; pos = -1
+
+                # Draw token right-aligned, highlighting match range if any
+                base_pen = QPen(opt.palette.mid().color())
+                acc_color = opt.palette.color(QPalette.ColorRole.Link)
+                if not acc_color.isValid():
+                    acc_color = QColor(30, 100, 200)
+                acc_pen = QPen(acc_color)
+
+                if pos >= 0 and q:
+                    pre = token[:pos]
+                    mid = token[pos:pos + len(q)]
+                    post = token[pos + len(q):]
+                    total_w = metrics.horizontalAdvance(token)
+                    x0 = token_rect.right() - total_w
+                    # vertical baseline
+                    y = token_rect.y() + (token_rect.height() + metrics.ascent() - metrics.descent()) // 2
+                    # draw pre
+                    painter.setPen(base_pen)
+                    painter.drawText(x0, y, pre)
+                    # draw mid (highlight)
+                    x1 = x0 + metrics.horizontalAdvance(pre)
+                    painter.setPen(acc_pen)
+                    painter.drawText(x1, y, mid)
+                    # draw post
+                    x2 = x1 + metrics.horizontalAdvance(mid)
+                    painter.setPen(base_pen)
+                    painter.drawText(x2, y, post)
+                else:
+                    painter.setPen(base_pen)
+                    painter.drawText(token_rect, _Qt.AlignmentFlag.AlignVCenter | _Qt.AlignmentFlag.AlignRight, token)
+            painter.restore()
+        except Exception:
+            super().paint(painter, option, index)
+
+
+class AccountCellDelegate(QStyledItemDelegate):
+    """Table delegate: shows JP text; on edit, opens QComboBox with token-aware search.
+
+    - Paint: draw cell text and a small dropdown indicator on the right
+    - Editor: QComboBox(editable) with lineEdit-attached QCompleter over [name, token]
+    - Commit: writes back Japanese-only name, mapping from token if必要
+    """
+
+    def __init__(self, names: list[str], token_to_name: dict[str, str], parent: Optional[QWidget] = None) -> None:  # type: ignore[name-defined]
+        super().__init__(parent)
+        self._names = list(names)
+        # map tokens (lowercase) => JP name
+        self._tok_map = {str(k).strip().lower(): v for k, v in (token_to_name or {}).items() if str(k).strip()}
+        self._editing_keys: set[tuple[int,int,int]] = set()
+
+    # ----- Painting -----
+    def paint(self, painter, option, index):  # type: ignore[override]
+        try:
+            opt = QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            # When editing this index, suppress base text to avoid double-draw
+            key = (id(index.model()), index.row(), index.column())
+            if key in self._editing_keys:
+                opt.text = ""
+            # draw default contents
+            style = opt.widget.style() if opt.widget else QApplication.style()
+            style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+            # draw dropdown indicator (small triangle) on the right
+            from PyQt6.QtGui import QPen
+            rect = opt.rect
+            tri = "▾"
+            pen = QPen(opt.palette.mid().color())
+            painter.save()
+            painter.setPen(pen)
+            painter.drawText(rect.adjusted(rect.width()-14, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, tri)
+            painter.restore()
+        except Exception:
+            super().paint(painter, option, index)
+
+    # ----- Editor -----
+    def createEditor(self, parent, option, index):  # type: ignore[override]
+        try:
+            combo = QComboBox(parent)
+            combo.setEditable(True)
+            try:
+                combo.setCompleter(None)  # disable combobox implicit completer
+            except Exception:
+                pass
+            # populate JP names only
+            for nm in self._names:
+                combo.addItem(nm)
+            # attach completer to the lineEdit with [name, token]
+            le = combo.lineEdit()
+            if le is not None:
+                model = QStandardItemModel()
+                rev: dict[str, set[str]] = {n: set() for n in self._names}
+                for tok, nm in self._tok_map.items():
+                    if nm in rev and tok:
+                        rev[nm].add(tok)
+                for nm in self._names:
+                    toks = sorted(rev.get(nm, set()))
+                    if toks:
+                        for t in toks:
+                            model.appendRow([QStandardItem(nm), QStandardItem(t)])
+                    else:
+                        model.appendRow([QStandardItem(nm), QStandardItem("")])
+                comp = QCompleter(model)
+                comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+                try:
+                    comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+                except Exception:
+                    pass
+                try:
+                    comp.setFilterMode(Qt.MatchFlag.MatchContains)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                try:
+                    comp.setCompletionColumn(1)
+                except Exception:
+                    pass
+                # token highlight
+                try:
+                    comp.popup().setItemDelegate(_AccountListDelegate(None, comp.popup()))
+                except Exception:
+                    pass
+                le.setCompleter(comp)
+                # on choose, set JP name to combo
+                def _on_idx(idx):
+                    try:
+                        nm = model.item(idx.row(), 0).text()
+                        if nm:
+                            combo.setCurrentText(nm)
+                    except Exception:
+                        pass
+                try:
+                    comp.activated[object].connect(_on_idx)  # type: ignore[arg-type]
+                except Exception:
+                    try:
+                        comp.activated.connect(lambda _t: None)
+                    except Exception:
+                        pass
+            # mark this index as editing so paint() won't draw underlying text
+            try:
+                key = (id(index.model()), index.row(), index.column())
+                self._editing_keys.add(key)
+            except Exception:
+                pass
+            return combo
+        except Exception:
+            return super().createEditor(parent, option, index)
+
+    def setEditorData(self, editor, index):  # type: ignore[override]
+        try:
+            if isinstance(editor, QComboBox):
+                val = str(index.model().data(index) or "")
+                editor.setCurrentText(val)
+                return
+        except Exception:
+            pass
+        super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index):  # type: ignore[override]
+        try:
+            if isinstance(editor, QComboBox):
+                txt = (editor.currentText() or "").strip()
+                # map tokens to JP if user typed token manually
+                low = txt.lower()
+                if low in self._tok_map:
+                    txt = self._tok_map[low]
+                model.setData(index, txt)
+                return
+        except Exception:
+            pass
+        super().setModelData(editor, model, index)
+
+    def updateEditorGeometry(self, editor, option, index):  # type: ignore[override]
+        try:
+            editor.setGeometry(option.rect)
+        except Exception:
+            super().updateEditorGeometry(editor, option, index)
+
+    def destroyEditor(self, editor, index):  # type: ignore[override]
+        # remove editing flag so paint resumes normal text
+        try:
+            key = (id(index.model()), index.row(), index.column())
+            if key in self._editing_keys:
+                self._editing_keys.remove(key)
+        except Exception:
+            pass
+        super().destroyEditor(editor, index)
+
+class AccountLineEdit(QLineEdit):
+    def __init__(self, names: list[str], token_to_name: dict[str, str]) -> None:
+        super().__init__()
+        self._names = list(names)
+        # reverse: name -> set(tokens)
+        self._rev: dict[str, set[str]] = {n: set() for n in names}
+        for tok, nm in token_to_name.items():
+            if nm in self._rev and tok:
+                t = str(tok).strip()
+                if t:
+                    self._rev[nm].add(t)
+        self._user_prefix: str = ""
+        try:
+            # Build completer model: one row per token; DisplayRole=name, UserRole+1=token
+            cmodel = QStandardItemModel()
+            for nm in names:
+                toks = sorted(self._rev.get(nm, set()))
+                if toks:
+                    for t in toks:
+                        it_name = QStandardItem(nm)
+                        it_tok = QStandardItem(t)
+                        # also stash token on UserRole+1 for delegate paint
+                        it_name.setData(t, 257)  # UserRole+1
+                        cmodel.appendRow([it_name, it_tok])
+                else:
+                    it_name = QStandardItem(nm)
+                    it_tok = QStandardItem("")
+                    cmodel.appendRow([it_name, it_tok])
+            comp = QCompleter(cmodel)
+            comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            try:
+                comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            except Exception:
+                pass
+            try:
+                comp.setFilterMode(Qt.MatchFlag.MatchContains)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            try:
+                comp.setCompletionColumn(1)
+            except Exception:
+                pass
+            # custom popup delegate to show token highlight
+            try:
+                popup = comp.popup()
+                popup.setItemDelegate(_AccountListDelegate(None, popup))
+            except Exception:
+                pass
+            self.setCompleter(comp)
+            self._completer = comp
+            self._cmodel = cmodel
+            # Map completion to JP name (column 0)
+            def _on_complete_index(idx):
+                try:
+                    nm = cmodel.item(idx.row(), 0).text()
+                    if nm:
+                        self.setText(nm)
+                except Exception:
+                    pass
+            try:
+                comp.activated[object].connect(_on_complete_index)  # type: ignore[arg-type]
+            except Exception:
+                try:
+                    comp.activated.connect(lambda _t: None)
+                except Exception:
+                    pass
+            # Normalize on focus out
+            try:
+                self.editingFinished.connect(lambda: self.setText(_normalize_account_text(self.text())))  # type: ignore[arg-type]
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _best_candidate(self, pref: str) -> str | None:
+        """Return best JP name for given ascii/jp prefix using tokens and names.
+        Preference: token startswith > token contains > name startswith > name contains.
+        """
+        q = (pref or "").lower()
+        if not q:
+            return None
+        # token startswith
+        starts: list[str] = []
+        contains: list[str] = []
+        for nm, toks in self._rev.items():
+            for t in toks:
+                tl = t.lower()
+                if tl.startswith(q):
+                    starts.append(nm)
+                    break
+                if q in tl:
+                    contains.append(nm)
+                    break
+        if starts:
+            return starts[0]
+        if contains:
+            return contains[0]
+        # fallback to JP name matching
+        for nm in self._names:
+            if nm.lower().startswith(q):
+                return nm
+        for nm in self._names:
+            if q in nm.lower():
+                return nm
+        return None
+
+    def keyPressEvent(self, ev):  # type: ignore[override]
+        # Enter accepts first visible completion when popup is open; otherwise normal
+        try:
+            from PyQt6.QtCore import Qt as _Qt
+            if ev.key() in (_Qt.Key.Key_Return, _Qt.Key.Key_Enter):
+                try:
+                    comp = getattr(self, '_completer', None)
+                    if comp is not None and comp.popup().isVisible():
+                        idx = comp.popup().currentIndex()
+                        if not idx.isValid():
+                            # choose first completion row
+                            m = comp.completionModel()
+                            row = 0
+                            col = comp.completionColumn()
+                            from PyQt6.QtCore import QModelIndex
+                            idx = m.index(row, col) if hasattr(m, 'index') else QModelIndex()
+                        # map to name (column 0) in our cmodel if possible
+                        try:
+                            cmodel = getattr(self, '_cmodel', None)
+                            if cmodel is not None:
+                                row = idx.row()
+                                nm = cmodel.item(row, 0).text()
+                                if nm:
+                                    self.setText(nm)
+                                    return
+                        except Exception:
+                            pass
+                        # fallback: accept current text
+                        self.setText(_normalize_account_text(self.text()))
+                        return
+                    else:
+                        # popup not visible → accept current text as-is
+                        self.setText(_normalize_account_text(self.text()))
+                        return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return super().keyPressEvent(ev)
+
+
+def _install_account_lineedits(container: QWidget, names: list[str], token_map: dict[str, str]) -> None:
+    try:
+        tables = container.findChildren(QTableWidget)
+    except Exception:
+        tables = []
+    for tbl in tables:
+        cols = _detect_account_columns(tbl)
+        if not cols:
+            continue
+        try:
+            rows = tbl.rowCount()
+        except Exception:
+            rows = 0
+        for r in range(rows):
+            for c in cols:
+                try:
+                    # Always overlay with a dropdown, even if an editor already exists
+                    # (prevents row0がテキストのまま残る問題)
+                    try:
+                        if tbl.cellWidget(r, c) is not None:
+                            tbl.removeCellWidget(r, c)
+                    except Exception:
+                        pass
+                    it = tbl.item(r, c)
+                    current = it.text().strip() if it else ""
+                    # Create dropdown combo with dedicated lineEdit completer
+                    combo = _AccountComboBox(names, token_map) if '_AccountComboBox' in globals() else QComboBox()
+                    try:
+                        combo.setEditable(True)
+                        combo.setCompleter(None)  # prevent implicit combobox auto-complete
+                        # Populate names (JP only)
+                        for nm in names:
+                            combo.addItem(nm)
+                        line = combo.lineEdit()
+                        if line is not None:
+                            # Build completer over [name, token]
+                            cmodel = QStandardItemModel()
+                            rev = {n: set() for n in names}
+                            for tok, nm in token_map.items():
+                                if nm in rev and tok:
+                                    rev[nm].add(str(tok).strip())
+                            for nm in names:
+                                toks = sorted(rev.get(nm, set()))
+                                if toks:
+                                    for t in toks:
+                                        cmodel.appendRow([QStandardItem(nm), QStandardItem(t)])
+                                else:
+                                    cmodel.appendRow([QStandardItem(nm), QStandardItem("")])
+                            comp = QCompleter(cmodel)
+                            comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+                            try:
+                                comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+                            except Exception:
+                                pass
+                            try:
+                                comp.setFilterMode(Qt.MatchFlag.MatchContains)  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+                            try:
+                                comp.setCompletionColumn(1)
+                            except Exception:
+                                pass
+                            # Beautify popup
+                            try:
+                                comp.popup().setItemDelegate(_AccountListDelegate(None, comp.popup()))
+                            except Exception:
+                                pass
+                            line.setCompleter(comp)
+                            # On completion, set JP name into combo (no index changes while editing)
+                            def _apply_idx(idx):
+                                try:
+                                    row = idx.row()
+                                    nm = cmodel.item(row, 0).text()
+                                    if nm:
+                                        combo.blockSignals(True)
+                                        combo.setCurrentText(nm)
+                                        combo.blockSignals(False)
+                                except Exception:
+                                    pass
+                            try:
+                                comp.activated[object].connect(_apply_idx)  # type: ignore[arg-type]
+                            except Exception:
+                                try:
+                                    comp.activated.connect(lambda _t: None)
+                                except Exception:
+                                    pass
+                            # While typing, keep focus and show popup; prevent index jumps
+                            def _on_edit(_t: str) -> None:
+                                try:
+                                    if not comp.popup().isVisible():
+                                        comp.complete()
+                                    line.setFocus()
+                                except Exception:
+                                    pass
+                            try:
+                                line.textEdited.connect(_on_edit)  # type: ignore[arg-type]
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    if current:
+                        try:
+                            combo.setCurrentText(current)
+                        except Exception:
+                            pass
+                    # Put widget and clear underlying item text to avoid overlap
+                    tbl.setCellWidget(r, c, combo)
+                    if it is None:
+                        tbl.setItem(r, c, QTableWidgetItem(""))
+                    else:
+                        try:
+                            it.setText("")
+                            it.setForeground(QBrush(QColor(0,0,0,0)))
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+
+    def _best_map(self, txt: str) -> str:
+        if not txt:
+            return txt
+        raw = txt.strip()
+        low = raw.lower()
+        # exact token match
+        if raw in self._token_to_name:
+            return self._token_to_name[raw]
+        if low in self._token_to_name_lower:
+            return self._token_to_name_lower[low]
+        # heuristics: split on spaces and punctuation
+        import re
+        parts = [p for p in re.split(r"[^0-9A-Za-z]+", low) if p]
+        # 1) if any numeric token present, match code exactly or by prefix
+        codes = [p for p in parts if any(ch.isdigit() for ch in p)]
+        for c in codes:
+            # prefer exact code
+            if c in self._token_to_name_lower:
+                return self._token_to_name_lower[c]
+            # or any token starting with the number
+            for k, v in self._token_to_name_lower.items():
+                if k.isdigit() and k.startswith(c):
+                    return v
+        # 2) alpha tokens: startswith match against tokens
+        alphas = [p for p in parts if p.isalpha() and len(p) >= 3]
+        for a in alphas:
+            # prefer startswith matches of tokens
+            for k, v in self._token_to_name_lower.items():
+                if k.isalpha() and k.startswith(a):
+                    return v
+        # 3) fallback: if user typed a display name prefix, leave as-is; otherwise prefer first item
+        try:
+            for i in range(self.count()):
+                name = self.itemText(i)
+                if name and name.startswith(raw):
+                    return name
+        except Exception:
+            pass
+        return raw
+
+    # Ensure normalization on Enter and on focus loss
+    def keyPressEvent(self, ev):  # type: ignore[override]
+        try:
+            from PyQt6.QtCore import Qt as _Qt
+            if ev.key() in ( _Qt.Key.Key_Return, _Qt.Key.Key_Enter ):
+                self._apply_normalization()
+        except Exception:
+            pass
+        return super().keyPressEvent(ev)
+
+    def focusOutEvent(self, ev):  # type: ignore[override]
+        try:
+            self._apply_normalization()
+        except Exception:
+            pass
+        return super().focusOutEvent(ev)
+
+
+class _AccountDelegate(QStyledItemDelegate):
+    """Table delegate that provides a dropdown with autocomplete for account columns."""
+
+    def __init__(self, account_names: list[str], parent: Optional[QWidget] = None) -> None:  # type: ignore[name-defined]
+        super().__init__(parent)
+        self._accounts = account_names or []
+
+    def createEditor(self, parent, option, index):  # type: ignore[override]
+        try:
+            _, token_map = _load_account_catalog()
+            combo = _AccountComboBox(self._accounts, token_map)
+            try:
+                # Show two-column-like popup using custom delegate
+                combo.setItemDelegate(_AccountListDelegate(combo))
+            except Exception:
+                pass
+            try:
+                combo.currentTextChanged.connect(lambda _t: combo._apply_normalization())  # type: ignore[arg-type]
+            except Exception:
+                pass
+            combo.setParent(parent)
+            return combo
+        except Exception:
+            return super().createEditor(parent, option, index)
+
+    def setEditorData(self, editor, index):  # type: ignore[override]
+        try:
+            val = str(index.model().data(index) or "")
+            if isinstance(editor, QComboBox):
+                # ensure current text matches existing cell text
+                editor.setCurrentText(val)
+                return
+        except Exception:
+            pass
+        super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index):  # type: ignore[override]
+        try:
+            if isinstance(editor, QComboBox):
+                # normalize before saving back to model
+                try:
+                    txt = editor.currentText()
+                    if hasattr(editor, '_best_map'):
+                        txt = editor._best_map(txt)  # type: ignore[attr-defined]
+                except Exception:
+                    txt = editor.currentText()
+                model.setData(index, txt)
+                return
+        except Exception:
+            pass
+        super().setModelData(editor, model, index)
+
+
+def _detect_account_columns(tbl: 'QTableWidget') -> list[int]:  # type: ignore[name-defined]
+    cols: list[int] = []
+    try:
+        n = tbl.columnCount()
+        for c in range(n):
+            try:
+                header = tbl.horizontalHeaderItem(c)
+                text = (header.text() if header else "") or ""
+            except Exception:
+                text = ""
+            t = str(text)
+            if not t:
+                continue
+            # Heuristics: contains 勘定 or 科目 and either 借方 or 貸方; exclude 金額
+            if (('勘定' in t or '科目' in t) and ('借' in t or '貸' in t) and ('金額' not in t)):
+                cols.append(c)
+        # Fallback to common positions if nothing detected
+        if not cols and n >= 4:
+            cols = [1, 3]
+    except Exception:
+        pass
+    return cols
+
+
+def _install_account_cell_widgets(container: QWidget, accounts: list[str]) -> None:
+    """Replace account text cells with visible comboboxes and keep item text in sync.
+
+    Safe to call repeatedly; skips cells already using a widget.
+    """
+    try:
+        tables = container.findChildren(QTableWidget)
+    except Exception:
+        tables = []
+    for tbl in tables:
+        cols = _detect_account_columns(tbl)
+        if not cols:
+            continue
+        rows = 0
+        try:
+            rows = tbl.rowCount()
+        except Exception:
+            rows = 0
+        for r in range(rows):
+            for c in cols:
+                try:
+                    if tbl.cellWidget(r, c) is not None:
+                        try:
+                            tbl.removeCellWidget(r, c)
+                        except Exception:
+                            pass
+                    item = tbl.item(r, c)
+                    current = (item.text().strip() if item else "")
+                    _, token_map = _load_account_catalog()
+                    combo = _AccountComboBox(accounts, token_map)
+                    try:
+                        combo.setItemDelegate(_AccountListDelegate(combo))
+                    except Exception:
+                        pass
+                    if current:
+                        try:
+                            combo.setCurrentText(current)
+                        except Exception:
+                            pass
+                    # hide underlying item text to avoid visual overlap
+                    try:
+                        if item is not None:
+                            item.setForeground(QBrush(QColor(0, 0, 0, 0)))
+                    except Exception:
+                        pass
+                    # keep item text in sync; normalization happens on commit (editingFinished/focusOut)
+                    def _sync(text, row=r, col=c, table=tbl, cb=combo):  # type: ignore[no-redef]
+                        it = table.item(row, col)
+                        if it is None:
+                            table.setItem(row, col, QTableWidgetItem(str(text)))
+                        else:
+                            it.setText(str(text))
+                    try:
+                        combo.currentTextChanged.connect(_sync)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                    tbl.setCellWidget(r, c, combo)
+                except Exception:
+                    continue
+
+
+def _install_account_dropdowns_in_window(win: QMainWindow) -> None:  # type: ignore[name-defined]
+    """Best-effort installer that scans the whole window and applies account dropdowns.
+
+    Runs safely even if there are no matching tables.
+    """
+    try:
+        accounts = _load_account_names()
+    except Exception:
+        accounts = []
+    try:
+        tables = win.findChildren(QTableWidget)  # type: ignore[name-defined]
+    except Exception:
+        tables = []
+    delegate = _AccountDelegate(accounts, win)
+    for tbl in tables:
+        cols = _detect_account_columns(tbl)
+        for c in cols:
+            try:
+                tbl.setItemDelegateForColumn(c, delegate)
+            except Exception:
+                pass
+        try:
+            _install_account_cell_widgets(tbl, accounts)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+
+def _normalize_account_text(txt: str) -> str:
+    """Normalize a possibly token-mixed text to the Japanese account display name.
+
+    Uses the same token dictionary as the dropdown; safe to call anywhere.
+    """
+    try:
+        _, token_map = _load_account_catalog()
+        token_map_lower = { (k or '').strip().lower(): v for k, v in token_map.items() }
+        raw = (txt or '').strip()
+        if not raw:
+            return raw
+        low = raw.lower()
+        if raw in token_map:
+            return token_map[raw]
+        if low in token_map_lower:
+            return token_map_lower[low]
+        import re
+        parts = [p for p in re.split(r"[^0-9A-Za-z]+", low) if p]
+        # prefer numeric exact or prefix
+        for p in parts:
+            if p in token_map_lower:
+                return token_map_lower[p]
+        for k, v in token_map_lower.items():
+            for p in parts:
+                if k.startswith(p):
+                    return v
+        return raw
+    except Exception:
+        return txt
 
 
 class CompanySelector(QDialog):
@@ -879,6 +1967,18 @@ class ReviewPage(QWidget):
         )
         self.table.itemSelectionChanged.connect(self._on_table_select)  # type: ignore[arg-type]
         self.table.itemChanged.connect(self._on_item_changed)  # type: ignore[arg-type]
+        # Install delegates and visible dropdowns directly on this table (debit=1, credit=3)
+        try:
+            names, token_map = _load_account_catalog()
+            if names:
+                delegate = AccountCellDelegate(names, token_map, self.table)
+                try:
+                    self.table.setItemDelegateForColumn(1, delegate)
+                    self.table.setItemDelegateForColumn(3, delegate)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Toolbar for save/later/delete
         btn_row = QHBoxLayout()
         self.btn_save = QPushButton("保存/OK（学習）")
@@ -928,12 +2028,23 @@ class ReviewPage(QWidget):
         # 全画面時に左ペインが潰れてNL入力欄が見えなくなるのを防止
         try:
             splitter.setChildrenCollapsible(False)
-            splitter.setCollapsible(0, False)
-            splitter.setCollapsible(1, False)
+            # Guard: avoid calling setCollapsible before widgets are added
+            if splitter.count() >= 1:
+                splitter.setCollapsible(0, False)
+            if splitter.count() >= 2:
+                splitter.setCollapsible(1, False)
         except Exception:
             pass
         splitter.addWidget(left_scroll)
         splitter.addWidget(right_wrap)
+        # After widgets are added, enforce non-collapsible explicitly (safe)
+        try:
+            if splitter.count() >= 1:
+                splitter.setCollapsible(0, False)
+            if splitter.count() >= 2:
+                splitter.setCollapsible(1, False)
+        except Exception:
+            pass
         try:
             splitter.setStretchFactor(0, int(UI_SETTINGS.get("splitter_stretch_left", 3)))
             splitter.setStretchFactor(1, int(UI_SETTINGS.get("splitter_stretch_right", 4)))
@@ -1519,13 +2630,19 @@ class ReviewPage(QWidget):
             w = self.table.cellWidget(r, c)
             if isinstance(w, QComboBox):
                 return w.currentText().strip()
+            try:
+                from PyQt6.QtWidgets import QLineEdit as _QLineEdit
+                if isinstance(w, _QLineEdit):
+                    return w.text().strip()
+            except Exception:
+                pass
             it = self.table.item(r, c)
             return it.text().strip() if it else ""
 
         date = val(r0, 0)
-        debit = val(r0, 1)
+        debit = _normalize_account_text(val(r0, 1))
         debit_amt = val(r0, 2)
-        credit = val(r0, 3)
+        credit = _normalize_account_text(val(r0, 3))
         credit_amt = val(r0, 4)
         summary = val(r0, 5)
         invoice = val(r0, 6)
@@ -1870,6 +2987,26 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.settings_page)
         self.setCentralWidget(self.stack)
 
+        # Install account dropdown + autocomplete on Review page table (勘定科目欄)
+        def _install_account_inputs() -> None:
+            try:
+                names, token_map = _load_account_catalog()
+                if not names or not hasattr(self, 'review_page'):
+                    return
+                try:
+                    tables = self.review_page.findChildren(QTableWidget)  # type: ignore[attr-defined]
+                except Exception:
+                    tables = []
+                for tbl in tables:
+                    try:
+                        _install_account_lineedits(tbl, names, token_map)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        _install_account_inputs()
+
         menubar = self.menuBar()
         # Add top-level actions on menu bar
         # Company selector first
@@ -1894,6 +3031,19 @@ class MainWindow(QMainWindow):
 
     def show_review(self) -> None:
         self.stack.setCurrentIndex(1)
+        # Re-apply delegate-based dropdown in case table was rebuilt
+        try:
+            names, token_map = _load_account_catalog()
+            if names and hasattr(self, 'review_page'):
+                for tbl in getattr(self.review_page, 'findChildren', lambda *_: [])(QTableWidget):  # type: ignore[name-defined]
+                    try:
+                        delegate = AccountCellDelegate(names, token_map, tbl)
+                        tbl.setItemDelegateForColumn(1, delegate)
+                        tbl.setItemDelegateForColumn(3, delegate)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def show_check(self) -> None:
         self.stack.setCurrentIndex(2)
@@ -1972,6 +3122,7 @@ def run_ui() -> None:
     win = MainWindow(company)
     win.resize(1100, 700)
     win.show()
+    # No deferred dropdown installer; account inputs are line-edit based and applied when pages build
     sys.exit(app.exec())
 
 
