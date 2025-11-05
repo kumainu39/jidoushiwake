@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 import re
@@ -7,13 +7,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 import os
-import base64
-import json
 
 
 LOGGER = logging.getLogger(__name__)
 
+# Externalized YOMITOKU integration
 from .yomitoku_ocr import extract_text_with_yomitoku
+
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
     LOGGER.info("Extracting text from PDF: %s", pdf_path)
@@ -112,33 +112,25 @@ def _extract_text_with_paddle(pdf_path: Path) -> str:
     return "\n".join(texts)
 
 
-# YOMITOKU OCR is now provided by a dedicated module for maintainability.
-
-
 def extract_text_both(pdf_path: Path) -> dict:
-    """Extract text via embedded text layer and YOMITOKU (PaddleOCR removed).
+    """Extract text via embedded text layer and YOMITOKU (PaddleOCR optional).
 
     Returns a dict with keys: text_pdf, text_yomitoku, text_combined.
 
-    text_combined always uses YOMITOKU output (hard requirement).
+    text_combined always uses YOMITOKU output.
     """
     LOGGER.info("[OCR] begin extract_text_both: %s", pdf_path)
     t_pdf = extract_text_from_pdf(pdf_path)
     LOGGER.info("[OCR] pdfminer/PyPDF2 extracted: %d chars", len(t_pdf or ""))
     t_yomi = extract_text_with_yomitoku(pdf_path, ensure=True)
     LOGGER.info("[OCR] YOMITOKU extracted: %d chars", len(t_yomi or ""))
-    # Enforce YOMITOKU usage: if unavailable or empty, treat as fatal
     if not (t_yomi and t_yomi.strip()):
         raise RuntimeError(
             "YOMITOKU OCR is required but not available or produced no text. "
             "Install and ensure 'yomitoku' CLI (or Python package) works. "
             "You can set YOMITOKU_EXE to the CLI path."
         )
-    # PaddleOCR usage removed by request
-    t_paddle = ""
 
-    # Prefer a single-source combined text: YOMITOKU > PDF > Paddle
-    # Always use YOMITOKU output for combined text (hard requirement)
     t_combined = t_yomi
 
     result = {
@@ -168,22 +160,24 @@ DATE_PATTERNS = [
 # Accept half-width and full-width digits/symbols. We normalize before parsing, but
 # keep a permissive regex as well to catch mixed strings.
 YEN_AMOUNT_PATTERNS = [
-    # Optional sign, optional Yen symbol, number (1,234 or 1234), optional 蜀・    re.compile(r"([\-竏綻?)\s*[ﾂ･・･]?\s*([0-9・・・兢{1,3}(?:[,・珪[0-9・・・兢{3})+|[0-9・・・兢+)\s*(?:蜀・?"),
+    # Optional sign, optional Yen symbol, number (1,234 or 1234), optional 円
+    re.compile(r"([\-−]?)\s*[¥￥]?\s*([0-9０-９]{1,3}(?:[,，][0-9０-９]{3})+|[0-9０-９]+)\s*(?:円)?"),
 ]
 
 # Translation table for full-width to half-width digits and punctuation used in amounts
 _FW_TO_HW = str.maketrans({
-    "・・: "0", "・・: "1", "・・: "2", "・・: "3", "・・: "4",
-    "・・: "5", "・・: "6", "・・: "7", "・・: "8", "・・: "9",
-    "・・: ",", "・・: ".", "・･": "ﾂ･", "・・: "-", "窶・: "-", "繝ｼ": "-",
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    "，": ",", "．": ".", "￥": "¥", "－": "-", "―": "-", "ー": "-",
 })
+
 
 def _normalize_amount_text(s: str) -> str:
     # Translate common full-width chars and collapse internal spaces
     s = s.translate(_FW_TO_HW)
     # Replace unusual thin/non-breaking spaces if present
     s = s.replace("\u2009", " ").replace("\u00A0", " ")
-    # Some OCR introduces spaces between digits: "8 0 0" 竊・"800"
+    # Some OCR introduces spaces between digits: "8 0 0" → "800"
     s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
     return s
 
@@ -213,7 +207,7 @@ def _parse_int_amount(s: str, sign: str = "") -> int:
     s = s.replace(",", "")
     try:
         val = int(s)
-        return -val if sign in ("-", "竏・) else val
+        return -val if sign in ("-", "−") else val
     except ValueError:
         return 0
 
@@ -225,7 +219,7 @@ def _find_amount(text: str) -> Optional[int]:
         lowered = line.lower()
         norm_line = _normalize_amount_text(line)
         weight = 1
-        if any(k in lowered for k in ("蜷郁ｨ・, "險・, "驥鷹｡・, "邊ｾ邂・, "隲区ｱる｡・, "遞手ｾｼ", "謾ｯ謇・)) or ("蜀・ in line or "ﾂ･" in line or "・･" in line):
+        if any(k in lowered for k in ("合計", "計", "金額", "精算", "請求額", "税込", "支払")) or ("円" in line or "¥" in line or "￥" in line):
             weight = 3
         for pat in YEN_AMOUNT_PATTERNS:
             for m in pat.finditer(norm_line):
@@ -245,44 +239,44 @@ def _find_amount(text: str) -> Optional[int]:
 
 
 VENDOR_KEYWORDS = {
-    "amazon": "豸郁怜刀雋ｻ",
-    "繧｢繝槭だ繝ｳ": "豸郁怜刀雋ｻ",
-    "讌ｽ螟ｩ": "豸郁怜刀雋ｻ",
-    "繝､繝槭ヨ": "闕ｷ騾驕玖ｳ・,
-    "菴仙ｷ・: "闕ｷ騾驕玖ｳ・,
-    "繧・≧繝代ャ繧ｯ": "闕ｷ騾驕玖ｳ・,
-    "驛ｵ萓ｿ": "騾壻ｿ｡雋ｻ",
-    "蛻・焔": "騾壻ｿ｡雋ｻ",
-    "繧ｿ繧ｯ繧ｷ繝ｼ": "譌・ｲｻ莠､騾夊ｲｻ",
-    "uber": "譌・ｲｻ莠､騾夊ｲｻ",
-    "jr": "譌・ｲｻ莠､騾夊ｲｻ",
-    "髮ｻ霆・: "譌・ｲｻ莠､騾夊ｲｻ",
-    "繧ｬ繧ｽ繝ｪ繝ｳ": "霆贋ｸ｡雋ｻ",
-    "eneos": "霆贋ｸ｡雋ｻ",
-    "蜃ｺ蜑埼､ｨ": "莨夊ｭｰ雋ｻ",
-    "繧ｦ繝ｼ繝舌・繧､繝ｼ繝・: "莨夊ｭｰ雋ｻ",
-    "繝槭け繝峨リ繝ｫ繝・: "莨夊ｭｰ雋ｻ",
-    "繧ｹ繧ｿ繝ｼ繝舌ャ繧ｯ繧ｹ": "莠､髫幄ｲｻ",
+    "amazon": "消耗品費",
+    "アマゾン": "消耗品費",
+    "楽天": "消耗品費",
+    "ヤマト": "荷造運賃",
+    "佐川": "荷造運賃",
+    "ゆうパック": "荷造運賃",
+    "郵便": "通信費",
+    "切手": "通信費",
+    "タクシー": "旅費交通費",
+    "uber": "旅費交通費",
+    "jr": "旅費交通費",
+    "電車": "旅費交通費",
+    "ガソリン": "車両費",
+    "eneos": "車両費",
+    "出前館": "会議費",
+    "ウーバーイーツ": "会議費",
+    "マクドナルド": "会議費",
+    "スターバックス": "交際費",
 }
 
 PAYMENT_KEYWORDS = {
-    "繧ｯ繝ｬ繧ｸ繝・ヨ": "譛ｪ謇暮≡",
-    "visa": "譛ｪ謇暮≡",
-    "mastercard": "譛ｪ謇暮≡",
-    "jcb": "譛ｪ謇暮≡",
-    "amex": "譛ｪ謇暮≡",
-    "paypay": "譛ｪ謇暮≡",
-    "line pay": "譛ｪ謇暮≡",
-    "讌ｽ螟ｩ繝壹う": "譛ｪ謇暮≡",
-    "隲区ｱよ嶌": "譛ｪ謇暮≡",
-    "謖ｯ霎ｼ": "譎ｮ騾夐宣≡",
-    "謖ｯ譖ｿ": "譎ｮ騾夐宣≡",
-    "蜈･驥・: "譎ｮ騾夐宣≡",
-    "蠑戊誠": "譎ｮ騾夐宣≡",
-    "迴ｾ驥・: "迴ｾ驥・,
-    "繝ｬ繧ｸ": "迴ｾ驥・,
-    "atm": "譎ｮ騾夐宣≡",
-    "驫陦・: "譎ｮ騾夐宣≡",
+    "クレジット": "未払金",
+    "visa": "未払金",
+    "mastercard": "未払金",
+    "jcb": "未払金",
+    "amex": "未払金",
+    "paypay": "未払金",
+    "line pay": "未払金",
+    "楽天ペイ": "未払金",
+    "請求書": "未払金",
+    "振込": "普通預金",
+    "振替": "普通預金",
+    "入金": "普通預金",
+    "引落": "普通預金",
+    "現金": "現金",
+    "レジ": "現金",
+    "atm": "普通預金",
+    "銀行": "普通預金",
 }
 
 
@@ -293,14 +287,14 @@ def _guess_accounts(text: str) -> Tuple[str, str]:
             debit = acc
             break
     else:
-        debit = "髮題ｲｻ"
+        debit = "雑費"
 
     for kw, acc in PAYMENT_KEYWORDS.items():
         if kw in t:
             credit = acc
             break
     else:
-        credit = "譛ｪ謇暮≡"
+        credit = "未払金"
     return debit, credit
 
 
@@ -311,29 +305,12 @@ def _extract_counterparty(text: str) -> str:
     for ln in head:
         if len(ln) < 3:
             continue
-        if re.search(r"[A-Za-z繧｡-繝ｳ・ｧ-・晢ｾ橸ｾ滉ｸ-鮴･]{2,}", ln):
-            if any(k in ln for k in ("鬆伜庶", "隲区ｱ・, "蜷郁ｨ・, "驥鷹｡・, "譏守ｴｰ", "蜀・ｨｳ")):
+        if re.search(r"[A-Za-zァ-ンｧ-ﾝﾞﾟ一-龥]{2,}", ln):
+            if any(k in ln for k in ("領収", "請求", "合計", "金額", "明細", "内訳")):
                 continue
             best = ln
             break
     return best[:64]
-
-
-def extract_journal_data(text: str) -> ParsedJournal:
-    date = _find_date_smart(text)
-    amount = _find_amount_smart(text)
-    debit, credit = _guess_accounts(text)
-    counterparty = _extract_counterparty_smart(text)
-    summary_parts = [p for p in [counterparty or None, "雉ｼ蜈･"] if p]
-    summary = " ".join(summary_parts) if summary_parts else "謾ｯ謇・
-    return ParsedJournal(
-        date=date,
-        amount=amount,
-        summary=summary,
-        debit_account=debit,
-        credit_account=credit,
-        counterparty=counterparty,
-    )
 
 
 # Improved helpers: smarter date/amount/counterparty detection
@@ -341,8 +318,8 @@ def _find_date_smart(text: str) -> Optional[str]:
     try:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         labeled = [
-            re.compile(r"(逋ｺ陦梧律|縺碑ｫ区ｱよ律|隲区ｱよ律|縺泌茜逕ｨ譌･|蛻ｩ逕ｨ譌･|雉ｼ蜈･譌･|縺願ｲｷ荳頑律|鬆伜庶譌･|蜿門ｼ墓律|豕ｨ譁・律|邏榊刀譌･|譌･莉・[:・咯?\s*(\d{4})[\./蟷ｴ・十-](\d{1,2})[\./譛茨ｼ十-](\d{1,2})譌･?"),
-            re.compile(r"(逋ｺ陦梧律|縺碑ｫ区ｱよ律|隲区ｱよ律|縺泌茜逕ｨ譌･|蛻ｩ逕ｨ譌･|雉ｼ蜈･譌･|縺願ｲｷ荳頑律|鬆伜庶譌･|蜿門ｼ墓律|豕ｨ譁・律|邏榊刀譌･|譌･莉・[:・咯?\s*(\d{4})(\d{2})(\d{2})"),
+            re.compile(r"(発行日|ご請求日|請求日|ご利用日|利用日|購入日|お買上日|領収日|取引日|注文日|納品日|日付)[:：]?\s*(\d{4})[\./年／\-](\d{1,2})[\./月／\-](\d{1,2})日?"),
+            re.compile(r"(発行日|ご請求日|請求日|ご利用日|利用日|購入日|お買上日|領収日|取引日|注文日|納品日|日付)[:：]?\s*(\d{4})(\d{2})(\d{2})"),
         ]
         for ln in lines:
             for pat in labeled:
@@ -352,7 +329,7 @@ def _find_date_smart(text: str) -> Optional[str]:
                     d = _norm_date(y, mm, dd)
                     if d:
                         return d
-        ignore = ("繧ｹ繧ｭ繝｣繝ｳ", "ScanSnap", "菴懈・", "逕滓・", "蜃ｺ蜉・, "蜊ｰ蛻ｷ", "菫晏ｭ・, "繧｢繝・・繝ｭ繝ｼ繝・, "download", "uploaded")
+        ignore = ("スキャン", "ScanSnap", "作成", "生成", "出力", "印刷", "保存", "アップロード", "download", "uploaded")
         generic = [
             re.compile(r"(20\d{2})[\-/\.](\d{1,2})[\-/\.](\d{1,2})"),
             re.compile(r"(\d{4})(\d{2})(\d{2})"),
@@ -376,12 +353,12 @@ def _find_date_smart(text: str) -> Optional[str]:
 def _find_amount_smart(text: str) -> Optional[int]:
     try:
         candidates: list[tuple[int, int]] = []
-        cues = ("蜷郁ｨ・, "蜷育ｮ・, "險・, "隲区ｱ・, "驥鷹｡・, "遞手ｾｼ", "遞取栢", "縺頑髪謇・, "縺碑ｫ区ｱ・, "縺皮ｲｾ邂・, "縺願ｲｷ荳・, "縺碑ｳｼ蜈･")
-        pat = re.compile(r"([\-竏綻?)\s*[ﾂ･\u00A5]?\s*([0-9]{1,3}(?:[,\s][0-9]{3})+|[0-9]+)\s*(?:蜀・?")
+        cues = ("合計", "計", "請求", "請求額", "金額", "税込", "税抜", "お支払", "ご請求", "ご精算", "お買上", "ご購入")
+        pat = re.compile(r"([\-−]?)\s*[¥\u00A5]?\s*([0-9]{1,3}(?:[,\s][0-9]{3})+|[0-9]+)\s*(?:円)?")
         for line in text.splitlines():
             norm = _normalize_amount_text(line)
             weight = 1
-            if any(k in line for k in cues) or ("蜀・ in line) or ("ﾂ･" in line):
+            if any(k in line for k in cues) or ("円" in line) or ("¥" in line) or ("￥" in line):
                 weight = 5
             for m in pat.finditer(norm):
                 sign = m.group(1) or ""
@@ -409,10 +386,28 @@ def _extract_counterparty_smart(text: str) -> str:
                 continue
             if any(bad in ln for bad in ("YOMITOKU", "Adobe", "Image", "ScanSnap", "FUJITSU")):
                 continue
-            if re.search(r"[A-Za-z繧｡-繝ｳ荳-鮴･縲・・]{2,}", ln):
-                if any(k in ln for k in ("鬆伜庶", "隲区ｱ・, "蜷郁ｨ・, "驥鷹｡・, "譏守ｴｰ", "蜈･驥・, "蜃ｺ驥・)):
+            if re.search(r"[A-Za-zァ-ンｧ-ﾝﾞﾟ一-龥]{2,}", ln):
+                if any(k in ln for k in ("領収", "請求", "合計", "金額", "明細", "入金", "出金")):
                     continue
                 return ln[:64]
     except Exception:
         pass
     return _extract_counterparty(text)
+
+
+def extract_journal_data(text: str) -> ParsedJournal:
+    date = _find_date_smart(text)
+    amount = _find_amount_smart(text)
+    debit, credit = _guess_accounts(text)
+    counterparty = _extract_counterparty_smart(text)
+    summary_parts = [p for p in [counterparty or None, "購入"] if p]
+    summary = " ".join(summary_parts) if summary_parts else "支払"
+    return ParsedJournal(
+        date=date,
+        amount=amount,
+        summary=summary,
+        debit_account=debit,
+        credit_account=credit,
+        counterparty=counterparty,
+    )
+
