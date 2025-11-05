@@ -1351,9 +1351,6 @@ class SettingsPage(QWidget):
         self.llm_lora_path = QLineEdit()
         self.llm_prompt_template = QLineEdit()
         llm_form = QFormLayout()
-        # Colab/remote settings and connectivity test
-        self.llm_use_colab = QLineEdit("0")
-        self.llm_remote_url = QLineEdit("http://localhost:8005")
         llm_form.addRow("Override使用(1/0)", self.llm_use_override)
         llm_form.addRow("Provider", self.llm_provider)
         llm_form.addRow("Model(GGUF)", self.llm_model_path)
@@ -1362,20 +1359,13 @@ class SettingsPage(QWidget):
         llm_form.addRow("Threads", self.llm_n_threads)
         llm_form.addRow("LoRA Path", self.llm_lora_path)
         llm_form.addRow("Prompt Template", self.llm_prompt_template)
-        llm_form.addRow("Use Colab(1/0)", self.llm_use_colab)
-        _ping_row = QHBoxLayout()
-        _ping_row.addWidget(self.llm_remote_url)
-        _btn_ping = QPushButton("接続テスト")
-        _btn_ping.clicked.connect(self.on_llm_ping)  # type: ignore[arg-type)
-        _ping_row.addWidget(_btn_ping)
-        _ping_container = QWidget(); _ping_container.setLayout(_ping_row)
-        llm_form.addRow("Remote URL", _ping_container)
         llm_save = QPushButton("LLM設定を保存")
-        llm_save.clicked.connect(self.on_save_llm)  # type: ignore[arg-type)
+        llm_save.clicked.connect(self.on_save_llm)  # type: ignore[arg-type]
         lg.addLayout(llm_form)
         lg.addWidget(llm_save)
         llm_group.setLayout(lg)
         layout.addWidget(llm_group)
+
         # LLM logs quick view
         logs_group = QGroupBox("LLMログ（最近）")
         lgl = QVBoxLayout()
@@ -1402,7 +1392,7 @@ class SettingsPage(QWidget):
                 timeout=10,
             )
             if r.ok:
-                QMessageBox.information(self, "保存", "LLM設定を保存しました")
+                QMessageBox.information(self, "保存", "設定を保存しました")
             else:
                 QMessageBox.warning(self, "保存失敗", r.text)
         except Exception as e:
@@ -1432,7 +1422,7 @@ class SettingsPage(QWidget):
                 timeout=10,
             )
             if r.ok:
-                QMessageBox.information(self, "保存", "LLM設定を保存しました")
+                QMessageBox.information(self, "保存", "勘定科目設定を保存しました")
             else:
                 QMessageBox.warning(self, "保存失敗", r.text)
         except Exception as e:
@@ -1496,8 +1486,6 @@ class SettingsPage(QWidget):
                 "n_threads": int(self.llm_n_threads.text()) if self.llm_n_threads.text().strip() else 4,
                 "lora_path": self.llm_lora_path.text().strip() or None,
                 "prompt_template": self.llm_prompt_template.text().strip() or None,
-                "use_colab": (self.llm_use_colab.text().strip() == "1"),
-                "remote_base_url": (self.llm_remote_url.text().strip() or None),
             }
             r = requests.post(f"{API_URL}/company_llm_settings", json=payload, timeout=10)
             if r.ok:
@@ -1506,21 +1494,7 @@ class SettingsPage(QWidget):
                 QMessageBox.warning(self, "保存失敗", r.text)
         except Exception as e:
             QMessageBox.warning(self, "保存失敗", str(e))
-    def on_llm_ping(self) -> None:
-        url = (self.llm_remote_url.text() or "").strip() or "http://localhost:8005"
-        try:
-            r = requests.post(f"{API_URL}/admin/llm_ping", json={"url": url}, timeout=5)
-            if not r.ok:
-                QMessageBox.warning(self, "接続テスト", f"失敗: {r.status_code} {r.text}")
-                return
-            data = r.json() or {}
-            if data.get("ok"):
-                ms = data.get("elapsed_ms")
-                QMessageBox.information(self, "接続テスト", f"接続成功: {data.get('url')} ({ms} ms)")
-            else:
-                QMessageBox.warning(self, "接続テスト", f"接続失敗: {data.get('url')}\n{data.get('detail') or ''}")
-        except Exception as e:
-            QMessageBox.warning(self, "接続テスト", f"エラー: {e}")
+
     def load_llm_logs(self) -> None:
         try:
             r = requests.get(f"{API_URL}/company_llm_logs", params={"company_name": self.company, "limit": 50}, timeout=10)
@@ -1546,12 +1520,12 @@ class SettingsPage(QWidget):
                 timeout=10,
             )
             if r.ok:
-                QMessageBox.information(self, "保存", "LLM設定を保存しました")
+                QMessageBox.information(self, "追加", "指示から会社別ルールを追加しました")
                 self.nl_instr_edit.setText("")
             else:
-                QMessageBox.warning(self, "保存失敗", r.text)
+                QMessageBox.warning(self, "追加失敗", r.text)
         except Exception as e:
-            QMessageBox.warning(self, "保存失敗", str(e))
+            QMessageBox.warning(self, "追加失敗", str(e))
 
 
 class OutputPage(QWidget):
@@ -1619,12 +1593,12 @@ class OutputPage(QWidget):
             r = requests.post(f"{API_URL}/export", params=params, timeout=60)
             if r.ok:
                 path = r.json().get("csv")
-                QMessageBox.information(self, "保存", "LLM設定を保存しました")
+                QMessageBox.information(self, "出力完了", f"出力しました:\n{path}")
                 self.refresh_history()
             else:
-                QMessageBox.warning(self, "保存失敗", r.text)
+                QMessageBox.warning(self, "出力失敗", r.text)
         except Exception as e:
-            QMessageBox.warning(self, "保存失敗", str(e))
+            QMessageBox.warning(self, "出力失敗", str(e))
 
     def choose_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "出力先フォルダ選択", self.dest_edit.text() or str(Path.home()))
@@ -1747,7 +1721,7 @@ class ScanPage(QWidget):
         base = Path(folder)
         files = [p for p in base.rglob("*.pdf")]
         if not files:
-            QMessageBox.information(self, "保存", "LLM設定を保存しました")
+            QMessageBox.information(self, "フォルダ取込", "PDFが見つかりませんでした")
             return
         prog = QProgressDialog("フォルダ取込中...", "中止", 0, len(files), self)
         prog.setWindowTitle("フォルダ取込 進捗")
@@ -1797,7 +1771,7 @@ class ScanPage(QWidget):
         try:
             ok = reserve_and_scan()
         except Exception as e:
-            QMessageBox.warning(self, "保存失敗", str(e))
+            QMessageBox.warning(self, "スキャン開始失敗", str(e))
 
         if not ok:
             QMessageBox.warning(self, "スキャン開始失敗", "ScanSnap Homeを起動できませんでした。")
@@ -2696,7 +2670,7 @@ class ReviewPage(QWidget):
     def _save_selected(self) -> None:
         doc_id, r0, r1 = self._selected_doc_id_and_rows()
         if doc_id is None or r0 is None or r1 is None:
-            QMessageBox.information(self, "保存", "LLM設定を保存しました")
+            QMessageBox.information(self, "保存", "行を選択してください")
             return
         data = self._collect_from_table(r0, r1)
         try:
@@ -2725,7 +2699,7 @@ class ReviewPage(QWidget):
                 timeout=20,
             )
             if r.ok:
-                QMessageBox.information(self, "保存", "LLM設定を保存しました")
+                QMessageBox.information(self, "保存", "仕訳を保存（学習）しました")
                 self._load_unconfirmed()
                 try:
                     win = self.window()
@@ -2785,15 +2759,15 @@ class ReviewPage(QWidget):
                 timeout=15,
             )
             if r.ok:
-                QMessageBox.information(self, "保存", "LLM設定を保存しました")
+                QMessageBox.information(self, "学習", "自然言語の指示を学習しました")
                 try:
                     self.nl_edit.setPlainText("")
                 except Exception:
                     self.nl_edit.setText("")
             else:
-                QMessageBox.warning(self, "保存失敗", r.text)
+                QMessageBox.warning(self, "学習失敗", r.text)
         except Exception as e:
-            QMessageBox.warning(self, "保存失敗", str(e))
+            QMessageBox.warning(self, "学習失敗", str(e))
 
     def refresh(self) -> None:
         # リスト表示は廃止。未確定データをテーブルに再読込。
@@ -2869,9 +2843,9 @@ class ReviewPage(QWidget):
             timeout=20,
         )
         if r.ok:
-            QMessageBox.information(self, "保存", "LLM設定を保存しました")
+            QMessageBox.information(self, "保存", "確定・学習しました")
         else:
-            QMessageBox.warning(self, "保存失敗", r.text)
+            QMessageBox.warning(self, "エラー", r.text)
         self.refresh()
 
     def on_delete(self) -> None:
@@ -3154,7 +3128,4 @@ def run_ui() -> None:
 
 if __name__ == "__main__":
     run_ui()
-
-
-
 

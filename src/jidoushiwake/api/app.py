@@ -569,6 +569,47 @@ def api_set_company_llm_settings(payload: CompanyLLMSettingsIn):
         )
 
 
+# Admin: LLM connectivity ping (Colab/remote endpoint)
+class LLMPingIn(BaseModel):
+    url: Optional[str] = None
+    timeout: Optional[float] = None
+
+
+class LLMPingOut(BaseModel):
+    ok: bool
+    url: str
+    elapsed_ms: Optional[int] = None
+    detail: Optional[str] = None
+
+
+@app.post("/admin/llm_ping", response_model=LLMPingOut)
+def api_llm_ping(payload: LLMPingIn):
+    import time as _time
+    from ..llm_client import LLMConfig as _LLMConfig, temporary_config as _temp_cfg, available as _llm_available
+
+    base = (payload.url or _LLM_SETTINGS.remote_base_url or _LLMConfig().remote_base_url or "http://localhost:8005").strip()
+    t0 = _time.perf_counter()
+    ok = False
+    detail = None
+    try:
+        cfg = _LLMConfig(
+            provider=_LLM_SETTINGS.provider,
+            model_path=_LLM_SETTINGS.model_path,
+            device="cpu",
+            n_gpu_layers=0,
+            n_threads=max(1, int(_LLM_SETTINGS.n_threads or 4)),
+            use_colab_remote=True,
+            remote_base_url=base,
+        )
+        with _temp_cfg(cfg):
+            ok = bool(_llm_available())
+    except Exception as e:
+        ok = False
+        detail = str(e)
+    elapsed = int(((_time.perf_counter() - t0) * 1000))
+    return LLMPingOut(ok=ok, url=base, elapsed_ms=elapsed, detail=detail)
+
+
 class CompanyLLMLogOut(BaseModel):
     document_id: int
     model_id: Optional[str]
