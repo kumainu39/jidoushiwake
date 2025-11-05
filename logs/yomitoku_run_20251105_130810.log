@@ -1,0 +1,94 @@
+[YOMITOKU] start: data\uploads\(レシート日付)_ri.pdf
+[YOMITOKU] using Python package
+[YOMITOKU] copied to temp ASCII path: data\uploads\yomitoku_output\yomi_cli_wumdubfl\input.pdf
+[YOMITOKU] CLI: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE
+[YOMITOKU] OutDir: data\uploads\yomitoku_output
+[YOMITOKU] Cmd: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE data\uploads\yomitoku_output\yomi_cli_wumdubfl\input.pdf -f md --combine --encoding utf-8 -o data\uploads\yomitoku_output
+[YOMITOKU] CLI returncode: 1
+[YOMITOKU] CLI stderr: 2025-11-05 13:08:15,064 - yomitoku.base - INFO - Initialize TextDetector
+2025-11-05 13:08:16,321 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-05 13:08:16,324 - yomitoku.base - INFO - Initialize TextRecognizer
+2025-11-05 13:08:17,782 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-05 13:08:17,785 - yomitoku.base - INFO - Initialize LayoutParser
+2025-11-05 13:08:18,528 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-05 13:08:18,535 - yomitoku.base - INFO - Initialize TableStructureRecognizer
+2025-11-05 13:08:19,369 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-05 13:08:19,381 - yomitoku.cli.main - INFO - Output directory: data\uploads\yomitoku_output
+2025-11-05 13:08:19,381 - yomitoku.cli.main - INFO - Processing file: data\uploads\yomitoku_output\yomi_cli_wumdubfl\input.pdf
+Traceback (most recent call last):
+  File "C:\jidoushiwake\.venv\Lib\site-packages\yomitoku\data\functions.py", line 109, in load_pdf
+    renderer = doc.render(
+               ^^^^^^^^^^
+AttributeError: 'PdfDocument' object has no attribute 'render'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\jidoushiwake\.venv\Scripts\yomitoku.EXE\__main__.py", line 7, in <module>
+  File "C:\jidoushiwake\.venv\Lib\site-packages\yomitoku\cli\main.py", line 470, in main
+    process_single_file(args, analyzer, path, format)
+  File "C:\jidoushiwake\.venv\Lib\site-packages\yomitoku\cli\main.py", line 93, in process_single_file
+    imgs = load_pdf(path)
+           ^^^^^^^^^^^^^^
+  File "C:\jidoushiwake\.venv\Lib\site-packages\yomitoku\data\functions.py", line 118, in load_pdf
+    raise ValueError(f"Failed to open the PDF file: {pdf_path}") from e
+ValueError: Failed to open the PDF file: data\uploads\yomitoku_output\yomi_cli_wumdu
+
+----- CLI STDOUT -----
+
+
+----- CLI STDERR -----
+2025-11-05 13:08:15,064 - yomitoku.base - INFO - Initialize TextDetector
+2025-11-05 13:08:16,321 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-05 13:08:16,324 - yomitoku.base - INFO - Initialize TextRecognizer
+2025-11-05 13:08:17,782 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-05 13:08:17,785 - yomitoku.base - INFO - Initialize LayoutParser
+2025-11-05 13:08:18,528 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-05 13:08:18,535 - yomitoku.base - INFO - Initialize TableStructureRecognizer
+2025-11-05 13:08:19,369 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-05 13:08:19,381 - yomitoku.cli.main - INFO - Output directory: data\uploads\yomitoku_output
+2025-11-05 13:08:19,381 - yomitoku.cli.main - INFO - Processing file: data\uploads\yomitoku_output\yomi_cli_wumdubfl\input.pdf
+Traceback (most recent call last):
+  File "C:\jidoushiwake\.venv\Lib\site-packages\yomitoku\data\functions.py", line 109, in load_pdf
+    renderer = doc.render(
+               ^^^^^^^^^^
+AttributeError: 'PdfDocument' object has no attribute 'render'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\jidoushiwake\.venv\Scripts\yomitoku.EXE\__main__.py", line 7, in <module>
+  File "C:\jidoushiwake\.venv\Lib\site-packages\yomitoku\cli\main.py", line 470, in main
+    process_single_file(args, analyzer, path, format)
+  File "C:\jidoushiwake\.venv\Lib\site-packages\yomitoku\cli\main.py", line 93, in process_single_file
+    imgs = load_pdf(path)
+           ^^^^^^^^^^^^^^
+  File "C:\jidoushiwake\.venv\Lib\site-packages\yomitoku\data\functions.py", line 118, in load_pdf
+    raise ValueError(f"Failed to open the PDF file: {pdf_path}") from e
+ValueError: Failed to open the PDF file: data\uploads\yomitoku_output\yomi_cli_wumdubfl\input.pdf
+-> Cannot close object; pdfium library is destroyed. This may cause a memory leak.
+
+[YOMITOKU] collected: input.pdf (13863 chars)
+[YOMITOKU] collected: input.pdf (13863 chars)
+[YOMITOKU] collected: input.pdf (10675 chars)
+[YOMITOKU] collected: input.pdf (5433 chars)
+[YOMITOKU] collected: input.pdf (10675 chars)
+[YOMITOKU] collected: input.pdf (5433 chars)
+[YOMITOKU] collected: input.pdf (5433 chars)
+[YOMITOKU] collected: input.pdf (5433 chars)
+[YOMITOKU] collected: input.pdf (10675 chars)
+[YOMITOKU] collected: input.pdf (5433 chars)
+[YOMITOKU] collected: input.pdf (10675 chars)
+[YOMITOKU] collected: input.pdf (5433 chars)
+[YOMITOKU] collected: input.pdf (5433 chars)
+[YOMITOKU] collected: input.pdf (13863 chars)
+[YOMITOKU] collected: input.pdf (13863 chars)
+[YOMITOKU] collected: input.pdf (13863 chars)
+[YOMITOKU] collected: input.pdf (13863 chars)
+[YOMITOKU] collected: input.pdf (10675 chars)
+[YOMITOKU] total collected text: 174618 chars
+[YOMITOKU] done

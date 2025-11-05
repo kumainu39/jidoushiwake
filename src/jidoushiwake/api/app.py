@@ -587,7 +587,12 @@ def api_llm_ping(payload: LLMPingIn):
     import time as _time
     from ..llm_client import LLMConfig as _LLMConfig, temporary_config as _temp_cfg, available as _llm_available
 
-    base = (payload.url or _LLM_SETTINGS.remote_base_url or _LLMConfig().remote_base_url or "http://localhost:8005").strip()
+    base = (
+        payload.url
+        or _LLM_SETTINGS.remote_base_url
+        or _LLMConfig().remote_base_url
+        or "https://nonbeneficent-oversoftly-piper.ngrok-free.dev"
+    ).strip()
     t0 = _time.perf_counter()
     ok = False
     detail = None

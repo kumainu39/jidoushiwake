@@ -143,17 +143,49 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
                 lora_path=c_llm.lora_path,
                 prompt_template=c_llm.prompt_template,
                 use_colab_remote=bool(getattr(c_llm, "use_colab_remote", getattr(c_llm, "use_colab", 0)) or False),
-                remote_base_url=(getattr(c_llm, "remote_base_url", None) or os.getenv("JIDOU_LLM_REMOTE_BASE") or "http://localhost:8005"),
+                remote_base_url=(
+                    getattr(c_llm, "remote_base_url", None)
+                    or os.getenv("JIDOU_LLM_REMOTE_BASE")
+                    or "https://nonbeneficent-oversoftly-piper.ngrok-free.dev"
+                ),
             )
             with temporary_config(cfg):
-                # Feed YOMITOKU first (if available) in the image OCR slot to prioritize it.
+                # Feed YOMITOKU first and add learned keyword mappings as hints.
                 _pdf_for_llm = texts.get("text_pdf") or ""
-                _img_for_llm = (texts.get("text_yomitoku") or "").strip()
-                llm_ref = refine_extraction(_pdf_for_llm, _img_for_llm)
+                _yomi = (texts.get("text_yomitoku") or "").strip()
+                try:
+                    hints_lines: list[str] = []
+                    for km in session.scalars(
+                        select(KeywordMapping).where(KeywordMapping.company_id == company_id)
+                    ):
+                        if not km.keyword:
+                            continue
+                        hints_lines.append(
+                            f"- keyword='{km.keyword}' -> debit='{km.debit_account}' credit='{km.credit_account}' weight={km.weight}"
+                        )
+                    if hints_lines:
+                        _yomi = (_yomi + "\n\n[学習ヒント]\n" + "\n".join(hints_lines)).strip()
+                except Exception:
+                    pass
+                llm_ref = refine_extraction(_pdf_for_llm, _yomi)
         else:
             _pdf_for_llm = texts.get("text_pdf") or ""
-            _img_for_llm = (texts.get("text_yomitoku") or "").strip()
-            llm_ref = refine_extraction(_pdf_for_llm, _img_for_llm)
+            _yomi = (texts.get("text_yomitoku") or "").strip()
+            try:
+                hints_lines: list[str] = []
+                for km in session.scalars(
+                    select(KeywordMapping).where(KeywordMapping.company_id == company_id)
+                ):
+                    if not km.keyword:
+                        continue
+                    hints_lines.append(
+                        f"- keyword='{km.keyword}' -> debit='{km.debit_account}' credit='{km.credit_account}' weight={km.weight}"
+                    )
+                if hints_lines:
+                    _yomi = (_yomi + "\n\n[学習ヒント]\n" + "\n".join(hints_lines)).strip()
+            except Exception:
+                pass
+            llm_ref = refine_extraction(_pdf_for_llm, _yomi)
         if llm_ref:
             parsed.date = llm_ref.get("date") or parsed.date
             try:

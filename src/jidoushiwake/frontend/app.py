@@ -1363,7 +1363,7 @@ class SettingsPage(QWidget):
             pass
         # Colab/remote settings and connectivity test
         self.llm_use_colab = QLineEdit("0")
-        self.llm_remote_url = QLineEdit("http://localhost:8005")
+        self.llm_remote_url = QLineEdit("https://nonbeneficent-oversoftly-piper.ngrok-free.dev")
         try:
             for w in (
                 self.llm_use_override,
@@ -1549,7 +1549,10 @@ class SettingsPage(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "保存失敗", str(e))
     def on_llm_ping(self) -> None:
-        url = (self.llm_remote_url.text() or "").strip() or "http://localhost:8005"
+        url = (
+            (self.llm_remote_url.text() or "").strip()
+            or "https://nonbeneficent-oversoftly-piper.ngrok-free.dev"
+        )
         try:
             r = requests.post(f"{API_URL}/admin/llm_ping", json={"url": url}, timeout=5)
             if not r.ok:
@@ -2797,18 +2800,47 @@ class ReviewPage(QWidget):
             pass
 
     def _delete_selected(self) -> None:
+        # Prefer table selection; if none, use current doc in view
         doc_id, _, _ = self._selected_doc_id_and_rows()
         if doc_id is None:
+            try:
+                idx = int(getattr(self, "_doc_index", 0))
+                docs = list(getattr(self, "_docs", []) or [])
+                if 0 <= idx < len(docs):
+                    doc_id = int(docs[idx].get("id"))
+            except Exception:
+                doc_id = None
+        if not doc_id:
             return
+        # Confirm delete
+        try:
+            resp = QMessageBox.question(
+                self,
+                "削除の確認",
+                "この仕訳を削除しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+        except Exception:
+            pass
+        # Delete via API and refresh
         try:
             requests.delete(f"{API_URL}/documents/{doc_id}", timeout=10)
+        except Exception:
+            pass
+        try:
+            # Keep index in range after deletion
+            curr = int(getattr(self, "_doc_index", 0))
+            total = max(0, len(getattr(self, "_docs", []) or []) - 1)
+            setattr(self, "_doc_index", max(0, min(curr, total)))
+        except Exception:
+            pass
+        try:
             self._load_unconfirmed()
-            try:
-                win = self.window()
-                if hasattr(win, 'scan_page'):
-                    win.scan_page.refresh()  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            win = self.window()
+            if hasattr(win, 'scan_page'):
+                win.scan_page.refresh()  # type: ignore[attr-defined]
         except Exception:
             pass
 
