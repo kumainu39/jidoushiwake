@@ -1351,9 +1351,37 @@ class SettingsPage(QWidget):
         self.llm_lora_path = QLineEdit()
         self.llm_prompt_template = QLineEdit()
         llm_form = QFormLayout()
+        try:
+            llm_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        except Exception:
+            pass
+        try:
+            # Add breathing room between rows and around the form
+            llm_form.setVerticalSpacing(10)
+            llm_form.setContentsMargins(8, 8, 8, 8)
+        except Exception:
+            pass
         # Colab/remote settings and connectivity test
         self.llm_use_colab = QLineEdit("0")
         self.llm_remote_url = QLineEdit("http://localhost:8005")
+        try:
+            for w in (
+                self.llm_use_override,
+                self.llm_provider,
+                self.llm_model_path,
+                self.llm_device,
+                self.llm_n_gpu_layers,
+                self.llm_n_threads,
+                self.llm_lora_path,
+                self.llm_prompt_template,
+                self.llm_use_colab,
+                self.llm_remote_url,
+            ):
+                w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                w.setMinimumWidth(280)
+                w.setMinimumHeight(28)
+        except Exception:
+            pass
         llm_form.addRow("Override使用(1/0)", self.llm_use_override)
         llm_form.addRow("Provider", self.llm_provider)
         llm_form.addRow("Model(GGUF)", self.llm_model_path)
@@ -1366,12 +1394,18 @@ class SettingsPage(QWidget):
         _ping_row = QHBoxLayout()
         _ping_row.addWidget(self.llm_remote_url)
         _btn_ping = QPushButton("接続テスト")
-        _btn_ping.clicked.connect(self.on_llm_ping)  # type: ignore[arg-type)
-        _ping_row.addWidget(_btn_ping)
+        _btn_ping.clicked.connect(self.on_llm_ping)  # type: ignore[arg-type]
+        try:
+            _btn_ping.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            _ping_row.addWidget(_btn_ping)
+            _ping_row.setStretch(0, 1)
+            _ping_row.setStretch(1, 0)
+        except Exception:
+            _ping_row.addWidget(_btn_ping)
         _ping_container = QWidget(); _ping_container.setLayout(_ping_row)
         llm_form.addRow("Remote URL", _ping_container)
         llm_save = QPushButton("LLM設定を保存")
-        llm_save.clicked.connect(self.on_save_llm)  # type: ignore[arg-type)
+        llm_save.clicked.connect(self.on_save_llm)  # type: ignore[arg-type]
         lg.addLayout(llm_form)
         lg.addWidget(llm_save)
         llm_group.setLayout(lg)
@@ -1387,7 +1421,15 @@ class SettingsPage(QWidget):
         logs_group.setLayout(lgl)
         layout.addWidget(logs_group)
         layout.addStretch(1)
-        self.setLayout(layout)
+        # Wrap entire settings page in a scroll area to prevent vertical squeeze
+        try:
+            content = QWidget(); content.setLayout(layout)
+            scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(content)
+            outer = QVBoxLayout(); outer.addWidget(scroll)
+            self.setLayout(outer)
+        except Exception:
+            # Fallback: direct layout (non-scroll)
+            self.setLayout(layout)
         self.load_settings()
         self.load_llm_settings()
         self.load_llm_logs()
@@ -3154,6 +3196,7 @@ def run_ui() -> None:
 
 if __name__ == "__main__":
     run_ui()
+
 
 
 
