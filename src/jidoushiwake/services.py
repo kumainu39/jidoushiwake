@@ -150,42 +150,9 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
                 ),
             )
             with temporary_config(cfg):
-                # Feed YOMITOKU first and add learned keyword mappings as hints.
-                _pdf_for_llm = texts.get("text_pdf") or ""
-                _yomi = (texts.get("text_yomitoku") or "").strip()
-                try:
-                    hints_lines: list[str] = []
-                    for km in session.scalars(
-                        select(KeywordMapping).where(KeywordMapping.company_id == company_id)
-                    ):
-                        if not km.keyword:
-                            continue
-                        hints_lines.append(
-                            f"- keyword='{km.keyword}' -> debit='{km.debit_account}' credit='{km.credit_account}' weight={km.weight}"
-                        )
-                    if hints_lines:
-                        _yomi = (_yomi + "\n\n[学習ヒント]\n" + "\n".join(hints_lines)).strip()
-                except Exception:
-                    pass
-                llm_ref = refine_extraction(_pdf_for_llm, _yomi)
+                llm_ref = _run_llm_refine_paginated(session, company_id, texts)
         else:
-            _pdf_for_llm = texts.get("text_pdf") or ""
-            _yomi = (texts.get("text_yomitoku") or "").strip()
-            try:
-                hints_lines: list[str] = []
-                for km in session.scalars(
-                    select(KeywordMapping).where(KeywordMapping.company_id == company_id)
-                ):
-                    if not km.keyword:
-                        continue
-                    hints_lines.append(
-                        f"- keyword='{km.keyword}' -> debit='{km.debit_account}' credit='{km.credit_account}' weight={km.weight}"
-                    )
-                if hints_lines:
-                    _yomi = (_yomi + "\n\n[学習ヒント]\n" + "\n".join(hints_lines)).strip()
-            except Exception:
-                pass
-            llm_ref = refine_extraction(_pdf_for_llm, _yomi)
+            llm_ref = _run_llm_refine_paginated(session, company_id, texts)
         if llm_ref:
             parsed.date = llm_ref.get("date") or parsed.date
             try:
@@ -287,6 +254,100 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
     )
     session.add(auto)
     return doc
+
+
+def _run_llm_refine_paginated(session: Session, company_id: int, texts: dict) -> Optional[dict]:
+    """Run LLM refinement page-by-page to avoid prompt size limits and combine results.
+
+    - Splits both PDFテキストとYOMITOKUテキスト into page-level chunks heuristically.
+    - Adds learned KeywordMapping as lightweight hints to each page payload.
+    - Merges the first non-null date, most frequent amount, and majority-vote accounts.
+    """
+    import re as _re
+
+    def _split_pages(s: str) -> list[str]:
+        s = s or ""
+        if "\f" in s:
+            parts = [p.strip() for p in s.split("\f") if p.strip()]
+            if parts:
+                return parts
+        # YOMITOKU: often markdown with headings like '## Page 1'
+        pages = _re.split(r"\n\s*#{1,3}\s*Page\s*\d+.*\n", s)
+        pages = [p.strip() for p in pages if p and p.strip()]
+        if len(pages) > 1:
+            return pages
+        # Fallback: chunk by ~4000 chars
+        chunk = 4000
+        out: list[str] = []
+        i = 0
+        while i < len(s):
+            out.append(s[i : i + chunk])
+            i += chunk
+        return [p.strip() for p in out if p.strip()]
+
+    pdf_all = texts.get("text_pdf") or ""
+    yomi_all = (texts.get("text_yomitoku") or "").strip()
+
+    pdf_pages = _split_pages(pdf_all)
+    yomi_pages = _split_pages(yomi_all)
+    # Align by index; if lengths differ, use closest available
+    max_n = max(len(pdf_pages) or 1, len(yomi_pages) or 1)
+
+    # Build hint lines from learned mappings
+    hints_lines: list[str] = []
+    try:
+        for km in session.scalars(select(KeywordMapping).where(KeywordMapping.company_id == company_id)):
+            if not km.keyword:
+                continue
+            hints_lines.append(
+                f"- keyword='{km.keyword}' -> debit='{km.debit_account}' credit='{km.credit_account}' weight={km.weight}"
+            )
+    except Exception:
+        pass
+    hint_block = ("\n\n[学習ヒント]\n" + "\n".join(hints_lines)) if hints_lines else ""
+
+    votes_amount: dict[int, int] = {}
+    votes_debit: dict[str, int] = {}
+    votes_credit: dict[str, int] = {}
+    chosen_date: Optional[str] = None
+    chosen_summary: Optional[str] = None
+
+    for i in range(max_n):
+        p_pdf = pdf_pages[i] if i < len(pdf_pages) else (pdf_pages[-1] if pdf_pages else "")
+        p_yomi = yomi_pages[i] if i < len(yomi_pages) else (yomi_pages[-1] if yomi_pages else "")
+        aug_yomi = (p_yomi + hint_block).strip()
+        try:
+            r = refine_extraction(p_pdf, aug_yomi)
+        except Exception:
+            r = None
+        if not r:
+            continue
+        if not chosen_date and r.get("date"):
+            chosen_date = r.get("date")
+        if not chosen_summary and r.get("summary"):
+            chosen_summary = r.get("summary")
+        amt = r.get("amount")
+        if isinstance(amt, int):
+            votes_amount[amt] = votes_amount.get(amt, 0) + 1
+        d = (r.get("debit_account") or "").strip()
+        if d:
+            votes_debit[d] = votes_debit.get(d, 0) + 1
+        c = (r.get("credit_account") or "").strip()
+        if c:
+            votes_credit[c] = votes_credit.get(c, 0) + 1
+
+    def _winner(dct: dict) -> Optional[Any]:
+        return max(dct.items(), key=lambda kv: kv[1])[0] if dct else None
+
+    if not (chosen_date or votes_amount or votes_debit or votes_credit or chosen_summary):
+        return None
+    return {
+        "date": chosen_date,
+        "amount": _winner(votes_amount),
+        "summary": chosen_summary,
+        "debit_account": _winner(votes_debit) or "",
+        "credit_account": _winner(votes_credit) or "",
+    }
 
 
 def mark_check_later(session: Session, document_id: int) -> None:

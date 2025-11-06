@@ -1809,7 +1809,10 @@ class ScanPage(QWidget):
             except Exception:
                 pass
             prog.setValue(i + 1)
-            prog.setLabelText(p.name)
+            try:
+                prog.setLabelText(f"{i+1}/{len(files)}: {p.name}")
+            except Exception:
+                pass
             if prog.wasCanceled():
                 break
         self.refresh()
