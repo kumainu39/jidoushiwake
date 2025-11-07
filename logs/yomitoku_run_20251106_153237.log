@@ -1,0 +1,30 @@
+[YOMITOKU] start: data\uploads\20251105.pdf
+[YOMITOKU] using Python package
+[YOMITOKU] CLI: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE
+[YOMITOKU] OutDir: data\uploads\yomitoku_output\20251105_20251106_153237_3385
+[YOMITOKU] Cmd: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE data\uploads\20251105.pdf -f md --combine --encoding utf-8 -o data\uploads\yomitoku_output\20251105_20251106_153237_3385
+[YOMITOKU] CLI returncode: 0
+
+----- CLI STDOUT -----
+
+
+----- CLI STDERR -----
+2025-11-06 15:32:44,312 - yomitoku.base - INFO - Initialize TextDetector
+2025-11-06 15:32:46,120 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:32:46,123 - yomitoku.base - INFO - Initialize TextRecognizer
+2025-11-06 15:32:47,582 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:32:47,586 - yomitoku.base - INFO - Initialize LayoutParser
+2025-11-06 15:32:48,669 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:32:48,672 - yomitoku.base - INFO - Initialize TableStructureRecognizer
+2025-11-06 15:32:49,717 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:32:49,732 - yomitoku.cli.main - INFO - Output directory: data\uploads\yomitoku_output\20251105_20251106_153237_3385
+2025-11-06 15:32:49,732 - yomitoku.cli.main - INFO - Processing file: data\uploads\20251105.pdf
+2025-11-06 15:32:51,988 - yomitoku.base - INFO - LayoutParser __call__ elapsed_time: 2.1790177822113037
+2025-11-06 15:32:51,995 - yomitoku.base - INFO - TableStructureRecognizer __call__ elapsed_time: 0.005240917205810547
+2025-11-06 15:32:53,373 - yomitoku.base - INFO - TextDetector __call__ elapsed_time: 3.565059185028076
+2025-11-06 15:33:08,663 - yomitoku.base - INFO - TextRecognizer __call__ elapsed_time: 15.290138244628906
+2025-11-06 15:33:08,702 - yomitoku.cli.main - INFO - Total Processing time: 18.97 sec
+
+[YOMITOKU] collected: uploads_20251105.md (638 chars)
+[YOMITOKU] total collected text: 638 chars
+[YOMITOKU] done

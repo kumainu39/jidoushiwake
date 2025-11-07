@@ -187,12 +187,25 @@ def extract_text_with_yomitoku(
         if exe is not None:
             try:
                 base_dir = pdf_path.parent
-                out_dir = output_dir or (
+                base_out = output_dir or (
                     Path(os.getenv("YOMITOKU_OUTPUT_DIR"))
                     if os.getenv("YOMITOKU_OUTPUT_DIR")
                     else (base_dir / "yomitoku_output")
                 )
-                out_dir.mkdir(parents=True, exist_ok=True)
+                base_out.mkdir(parents=True, exist_ok=True)
+
+                # Use a per-run subdirectory to avoid collisions between files.
+                # If filename has non-ASCII chars, also include a timestamp for uniqueness.
+                try:
+                    import time, re, random
+
+                    stem = pdf_path.stem
+                    stem_ascii = re.sub(r"[^0-9A-Za-z._-]", "_", stem)
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    run_out = base_out / f"{stem_ascii}_{ts}_{random.randint(1000,9999)}"
+                except Exception:
+                    run_out = base_out / "run"
+                run_out.mkdir(parents=True, exist_ok=True)
                 fmt_val = fmt or os.getenv("YOMITOKU_FORMAT", "md")
 
                 # Workaround: Some environments fail with non-ASCII filenames. Copy to temp with ASCII name.
@@ -218,7 +231,7 @@ def extract_text_with_yomitoku(
                     "--encoding",
                     "utf-8",
                     "-o",
-                    str(out_dir),
+                    str(run_out),
                 ]
 
                 # Optional extra args via env (e.g., "--lang ja --dpi 300")
@@ -232,7 +245,7 @@ def extract_text_with_yomitoku(
                 except Exception:
                     pass
                 _log_progress(f"[YOMITOKU] CLI: {exe}", progress, run_log)
-                _log_progress(f"[YOMITOKU] OutDir: {out_dir}", progress, run_log)
+                _log_progress(f"[YOMITOKU] OutDir: {run_out}", progress, run_log)
                 _log_progress(f"[YOMITOKU] Cmd: {' '.join(cmd)}", progress, run_log)
 
                 timeout_env = os.getenv("YOMITOKU_TIMEOUT")
@@ -250,6 +263,8 @@ def extract_text_with_yomitoku(
                     check=False,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="ignore",
                     timeout=timeout_s,
                     env=env,
                 )
@@ -275,7 +290,7 @@ def extract_text_with_yomitoku(
                     "combined.json",
                 ]
                 for name in preferred:
-                    f = out_dir / name
+                    f = run_out / name
                     if f.exists() and f.is_file():
                         try:
                             txt = f.read_text(encoding="utf-8", errors="ignore")
@@ -287,7 +302,7 @@ def extract_text_with_yomitoku(
                             pass
                 if not collected:
                     for pat in ("**/*.md", "**/*.txt", "**/*.json", "**/*.*"):
-                        for f in sorted(out_dir.glob(pat)):
+                        for f in sorted(run_out.glob(pat)):
                             if f.is_dir():
                                 continue
                             try:
@@ -373,7 +388,7 @@ def process_pdf(
         cmd.insert(4, "--combine")
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=False)
     except FileNotFoundError as e:
         return {
             "ok": False,

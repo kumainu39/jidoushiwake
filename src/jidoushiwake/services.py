@@ -31,7 +31,7 @@ from .models import (
 )
 from .ocr_extract import extract_text_from_pdf, extract_journal_data, extract_text_both
 from .yayoi_exporter import AccountSide, JournalEntry, JournalExporter
-from .llm_client import refine_extraction
+from .llm_client import refine_extraction, refine_extraction_with_yomi
 from .llm_client import parse_nl_rule
 
 
@@ -155,11 +155,7 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
             llm_ref = _run_llm_refine_paginated(session, company_id, texts)
         if llm_ref:
             parsed.date = llm_ref.get("date") or parsed.date
-            try:
-                amt = llm_ref.get("amount")
-                parsed.amount = int(amt) if amt is not None else parsed.amount
-            except Exception:
-                pass
+            # AmountはYOMITOKUヒューリスティックの結果を優先し、LLMの推測では上書きしない
             parsed.summary = llm_ref.get("summary") or parsed.summary
             parsed.debit_account = llm_ref.get("debit_account") or parsed.debit_account
             parsed.credit_account = llm_ref.get("credit_account") or parsed.credit_account
@@ -285,7 +281,8 @@ def _run_llm_refine_paginated(session: Session, company_id: int, texts: dict) ->
             i += chunk
         return [p.strip() for p in out if p.strip()]
 
-    pdf_all = texts.get("text_pdf") or ""
+    # PDF embedded text disabled; rely on YOMITOKU only
+    pdf_all = ""
     yomi_all = (texts.get("text_yomitoku") or "").strip()
 
     pdf_pages = _split_pages(pdf_all)
@@ -317,7 +314,8 @@ def _run_llm_refine_paginated(session: Session, company_id: int, texts: dict) ->
         p_yomi = yomi_pages[i] if i < len(yomi_pages) else (yomi_pages[-1] if yomi_pages else "")
         aug_yomi = (p_yomi + hint_block).strip()
         try:
-            r = refine_extraction(p_pdf, aug_yomi)
+            # Use YOMITOKU-only refinement
+            r = refine_extraction_with_yomi("", aug_yomi, "")
         except Exception:
             r = None
         if not r:
@@ -364,6 +362,166 @@ def delete_document(session: Session, document_id: int) -> None:
         return
     session.delete(doc)
 
+
+def _extract_tax_breakdown(text: str) -> list[dict]:
+    """Extract 10%/8% tax-rate breakdown from YOMITOKU OCR text.
+
+    Returns a list of dicts like {"rate": 10|8, "net": int|None, "tax": int|None, "gross": int|None}.
+    Best-effort heuristics: looks for lines mentioning 10%/8% (軽減) and nearby
+    lines with keywords like 対象/小計/金額 (net), 消費税/税額 (tax), 合計 (gross).
+    """
+    try:
+        import re as _re
+
+        def _to_half(s: str) -> str:
+            tbl = str.maketrans({
+                "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+                "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+                "％": "%", "，": ",", "．": ".",
+            })
+            return s.translate(tbl)
+
+        def _nums_in(line: str) -> list[int]:
+            line = _to_half(line)
+            line = _re.sub(r"(?<=\d)\s+(?=\d)", "", line)
+            out: list[int] = []
+            for m in _re.finditer(r"([0-9]{1,3}(?:[,\s][0-9]{3})+|[0-9]+)", line):
+                n = int(m.group(1).replace(",", "").replace(" ", ""))
+                if n > 0:
+                    out.append(n)
+            return out
+
+        def _rate_tag(s: str) -> int | None:
+            ss = _to_half(s)
+            low = ss.lower()
+            is10 = ("10%" in low) or ("標準" in low)
+            is8 = ("8%" in low) or ("軽減" in low)
+            if is10 and not is8:
+                return 10
+            if is8 and not is10:
+                return 8
+            # ambiguous: return None
+            return None
+
+        lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+        found: dict[int, dict] = {}
+        i = 0
+        while i < len(lines):
+            rate = _rate_tag(lines[i])
+            if rate is None:
+                i += 1
+                continue
+            rec = found.setdefault(rate, {"rate": rate, "net": None, "tax": None, "gross": None})
+            # look ahead up to 2 lines for amounts with keywords
+            for k in range(0, 3):
+                if i + k >= len(lines):
+                    break
+                ln = lines[i + k]
+                # stop if a different rate block clearly starts
+                other = _rate_tag(ln)
+                if other is not None and other != rate and k > 0:
+                    break
+                nums = _nums_in(ln)
+                if not nums:
+                    continue
+                n = nums[-1]  # prefer the last number on the line
+                low = _to_half(ln).lower()
+                if ("税" in low) or ("消費税" in low):
+                    rec["tax"] = rec["tax"] or n
+                elif ("合計" in low) or ("計" in low and "明細" not in low):
+                    rec["gross"] = rec["gross"] or n
+                elif any(k in low for k in ("対象", "小計", "金額", "売上", "仕入")):
+                    rec["net"] = rec["net"] or n
+            i += 1
+
+        # compute missing values
+        out: list[dict] = []
+        for rate, rec in sorted(found.items()):
+            net, tax, gross = rec.get("net"), rec.get("tax"), rec.get("gross")
+            try:
+                if net is not None and tax is not None and gross is None:
+                    gross = net + tax
+                elif gross is not None and tax is not None and net is None:
+                    net = max(gross - tax, 0)
+                elif gross is not None and net is not None and tax is None:
+                    tax = max(gross - net, 0)
+            except Exception:
+                pass
+            if any(v is not None for v in (net, tax, gross)):
+                out.append({"rate": rate, "net": net, "tax": tax, "gross": gross})
+        return out
+    except Exception:
+        return []
+
+
+def _build_entries_for_document(doc: Document) -> list[JournalEntry]:
+    """Create one or more JournalEntry rows for a document.
+
+    - If 10%/8% breakdown is detected, emit one row per rate with tax_category/tax_amount set on the debit side.
+    - Otherwise, emit a single row with no tax fields.
+    """
+    entries: list[JournalEntry] = []
+    ar = doc.auto_result
+    if not ar:
+        return entries
+
+    from datetime import datetime as _dt
+
+    def _tax_cat(rate: int) -> str:
+        return "課税仕入8%(軽)" if rate == 8 else "課税仕入10%"
+
+    parts = _extract_tax_breakdown(doc.ocr_text or "")
+    if parts:
+        for p in parts:
+            try:
+                rate = int(p.get("rate") or 0)
+            except Exception:
+                rate = 0
+            net = p.get("net")
+            tax = p.get("tax") or 0
+            if not net:
+                # as a fallback, prefer gross if available
+                gross = p.get("gross")
+                if gross is None:
+                    continue
+                net = max(int(gross) - int(tax or 0), 0)
+            amount_base = abs(int(net))
+            tax_amt = abs(int(tax or 0))
+            entry = JournalEntry(
+                identifier_flag="****",
+                voucher_number="1",
+                transaction_date=ar.date or _dt.now().strftime("%Y/%m/%d"),
+                debit=AccountSide(
+                    account=ar.debit_account or "",
+                    amount=amount_base,
+                    tax_category=_tax_cat(rate) if rate in (8, 10) else "",
+                    tax_amount=tax_amt,
+                ),
+                credit=AccountSide(
+                    account=ar.credit_account or "",
+                    amount=amount_base,
+                ),
+                summary=(ar.summary or "")[:64],
+                reference_number=str(Path(doc.file_path).stem)[:10],
+                memo=str(Path(doc.file_path).name)[:180],
+            )
+            entries.append(entry)
+
+    if not entries:
+        # Fallback: single-line entry without tax fields
+        entry = JournalEntry(
+            identifier_flag="****",
+            voucher_number="1",
+            transaction_date=ar.date or _dt.now().strftime("%Y/%m/%d"),
+            debit=AccountSide(account=ar.debit_account or "", amount=abs(ar.amount or 0)),
+            credit=AccountSide(account=ar.credit_account or "", amount=abs(ar.amount or 0)),
+            summary=(ar.summary or "")[:64],
+            reference_number=str(Path(doc.file_path).stem)[:10],
+            memo=str(Path(doc.file_path).name)[:180],
+        )
+        entries.append(entry)
+
+    return entries
 
 def confirm_document(
     session: Session,
@@ -456,18 +614,8 @@ def confirm_document(
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     out_path = settings.output_dir / f"{date_for_name}_yayoi.csv"
 
-    entry = JournalEntry(
-        identifier_flag="****",
-        voucher_number="1",
-        transaction_date=doc.auto_result.date or datetime.now().strftime("%Y/%m/%d"),
-        debit=AccountSide(account=doc.auto_result.debit_account, amount=abs(doc.auto_result.amount or 0)),
-        credit=AccountSide(account=doc.auto_result.credit_account, amount=abs(doc.auto_result.amount or 0)),
-        summary=(doc.auto_result.summary or "")[:64],
-        reference_number=str(Path(doc.file_path).stem)[:10],
-        memo=str(Path(doc.file_path).name)[:180],
-    )
-
-    exporter = JournalExporter(entries=[entry])
+    entries = _build_entries_for_document(doc)
+    exporter = JournalExporter(entries=entries)
     exporter.save(out_path, encoding="utf-8")
 
     # Duplicate and archive stamped PDF copies
@@ -506,18 +654,7 @@ def export_confirmed_csv(
     for d in docs:
         if not d.auto_result:
             continue
-        ar = d.auto_result
-        entry = JournalEntry(
-            identifier_flag="****",
-            voucher_number="1",
-            transaction_date=ar.date or datetime.now().strftime("%Y/%m/%d"),
-            debit=AccountSide(account=ar.debit_account or "", amount=abs(ar.amount or 0)),
-            credit=AccountSide(account=ar.credit_account or "", amount=abs(ar.amount or 0)),
-            summary=(ar.summary or "")[:64],
-            reference_number=str(Path(d.file_path).stem)[:10],
-            memo=str(Path(d.file_path).name)[:180],
-        )
-        entries.append(entry)
+        entries.extend(_build_entries_for_document(d))
 
     settings = get_settings()
     target_dir = output_dir or settings.output_dir

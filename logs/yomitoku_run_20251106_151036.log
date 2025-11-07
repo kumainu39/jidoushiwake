@@ -1,0 +1,30 @@
+[YOMITOKU] start: data\uploads\20251105.pdf
+[YOMITOKU] using Python package
+[YOMITOKU] CLI: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE
+[YOMITOKU] OutDir: data\uploads\yomitoku_output\20251105_20251106_151036_4581
+[YOMITOKU] Cmd: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE data\uploads\20251105.pdf -f md --combine --encoding utf-8 -o data\uploads\yomitoku_output\20251105_20251106_151036_4581
+[YOMITOKU] CLI returncode: 0
+
+----- CLI STDOUT -----
+
+
+----- CLI STDERR -----
+2025-11-06 15:10:44,855 - yomitoku.base - INFO - Initialize TextDetector
+2025-11-06 15:10:46,562 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:10:46,562 - yomitoku.base - INFO - Initialize TextRecognizer
+2025-11-06 15:10:47,956 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:10:47,969 - yomitoku.base - INFO - Initialize LayoutParser
+2025-11-06 15:10:49,056 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:10:49,071 - yomitoku.base - INFO - Initialize TableStructureRecognizer
+2025-11-06 15:10:50,220 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:10:50,234 - yomitoku.cli.main - INFO - Output directory: data\uploads\yomitoku_output\20251105_20251106_151036_4581
+2025-11-06 15:10:50,234 - yomitoku.cli.main - INFO - Processing file: data\uploads\20251105.pdf
+2025-11-06 15:10:52,648 - yomitoku.base - INFO - LayoutParser __call__ elapsed_time: 2.3394460678100586
+2025-11-06 15:10:52,654 - yomitoku.base - INFO - TableStructureRecognizer __call__ elapsed_time: 0.005010128021240234
+2025-11-06 15:10:53,738 - yomitoku.base - INFO - TextDetector __call__ elapsed_time: 3.428632974624634
+2025-11-06 15:11:15,285 - yomitoku.base - INFO - TextRecognizer __call__ elapsed_time: 21.54651379585266
+2025-11-06 15:11:15,360 - yomitoku.cli.main - INFO - Total Processing time: 25.13 sec
+
+[YOMITOKU] collected: uploads_20251105.md (638 chars)
+[YOMITOKU] total collected text: 638 chars
+[YOMITOKU] done

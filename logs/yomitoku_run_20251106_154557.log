@@ -1,0 +1,30 @@
+[YOMITOKU] start: data\uploads\20250318_天王寺店.pdf
+[YOMITOKU] using Python package
+[YOMITOKU] CLI: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE
+[YOMITOKU] OutDir: data\uploads\yomitoku_output\20250318______20251106_154602_4008
+[YOMITOKU] Cmd: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE data\uploads\20250318_天王寺店.pdf -f md --combine --encoding utf-8 -o data\uploads\yomitoku_output\20250318______20251106_154602_4008
+[YOMITOKU] CLI returncode: 0
+
+----- CLI STDOUT -----
+
+
+----- CLI STDERR -----
+2025-11-06 15:46:10,478 - yomitoku.base - INFO - Initialize TextDetector
+2025-11-06 15:46:12,210 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:46:12,225 - yomitoku.base - INFO - Initialize TextRecognizer
+2025-11-06 15:46:13,531 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:46:13,535 - yomitoku.base - INFO - Initialize LayoutParser
+2025-11-06 15:46:14,502 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:46:14,512 - yomitoku.base - INFO - Initialize TableStructureRecognizer
+2025-11-06 15:46:15,573 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:46:15,603 - yomitoku.cli.main - INFO - Output directory: data\uploads\yomitoku_output\20250318______20251106_154602_4008
+2025-11-06 15:46:15,603 - yomitoku.cli.main - INFO - Processing file: data\uploads\20250318_天王寺店.pdf
+2025-11-06 15:46:18,321 - yomitoku.base - INFO - LayoutParser __call__ elapsed_time: 2.670417070388794
+2025-11-06 15:46:18,329 - yomitoku.base - INFO - TableStructureRecognizer __call__ elapsed_time: 0.00799560546875
+2025-11-06 15:46:19,718 - yomitoku.base - INFO - TextDetector __call__ elapsed_time: 4.067371606826782
+2025-11-06 15:46:24,458 - yomitoku.base - INFO - TextRecognizer __call__ elapsed_time: 4.7396721839904785
+2025-11-06 15:46:24,466 - yomitoku.cli.main - INFO - Total Processing time: 8.86 sec
+
+[YOMITOKU] collected: uploads_20250318_天王寺店.md (243 chars)
+[YOMITOKU] total collected text: 243 chars
+[YOMITOKU] done

@@ -1,0 +1,36 @@
+[YOMITOKU] start: data\uploads\20250820_株式会社.pdf
+[YOMITOKU] using Python package
+[YOMITOKU] copied to temp ASCII path: data\uploads\yomitoku_output\yomi_cli_900h9vzy\input.pdf
+[YOMITOKU] CLI: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE
+[YOMITOKU] OutDir: data\uploads\yomitoku_output
+[YOMITOKU] Cmd: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE data\uploads\yomitoku_output\yomi_cli_900h9vzy\input.pdf -f md --combine --encoding utf-8 -o data\uploads\yomitoku_output
+[YOMITOKU] CLI returncode: 0
+
+----- CLI STDOUT -----
+
+
+----- CLI STDERR -----
+2025-11-06 13:00:59,059 - yomitoku.base - INFO - Initialize TextDetector
+2025-11-06 13:01:00,495 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 13:01:00,500 - yomitoku.base - INFO - Initialize TextRecognizer
+2025-11-06 13:01:01,814 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 13:01:01,818 - yomitoku.base - INFO - Initialize LayoutParser
+2025-11-06 13:01:02,807 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 13:01:02,826 - yomitoku.base - INFO - Initialize TableStructureRecognizer
+2025-11-06 13:01:03,781 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 13:01:03,788 - yomitoku.cli.main - INFO - Output directory: data\uploads\yomitoku_output
+2025-11-06 13:01:03,788 - yomitoku.cli.main - INFO - Processing file: data\uploads\yomitoku_output\yomi_cli_900h9vzy\input.pdf
+2025-11-06 13:01:06,390 - yomitoku.base - INFO - LayoutParser __call__ elapsed_time: 2.5836181640625
+2025-11-06 13:01:06,395 - yomitoku.base - INFO - TableStructureRecognizer __call__ elapsed_time: 0.003347635269165039
+2025-11-06 13:01:08,988 - yomitoku.base - INFO - TextDetector __call__ elapsed_time: 5.181647777557373
+2025-11-06 13:01:15,593 - yomitoku.base - INFO - TextRecognizer __call__ elapsed_time: 6.603788375854492
+2025-11-06 13:01:15,609 - yomitoku.cli.main - INFO - Total Processing time: 11.82 sec
+
+[YOMITOKU] collected: uploads_20251105.md (638 chars)
+[YOMITOKU] collected: yomi_cli_3hnd81si_input.md (476 chars)
+[YOMITOKU] collected: yomi_cli_900h9vzy_input.md (263 chars)
+[YOMITOKU] collected: yomi_cli_bcapov00_input.md (243 chars)
+[YOMITOKU] collected: yomi_cli_sp_4ysto_input.md (476 chars)
+[YOMITOKU] collected: yomi_cli_v7qiv8ei_input.md (243 chars)
+[YOMITOKU] total collected text: 2349 chars
+[YOMITOKU] done

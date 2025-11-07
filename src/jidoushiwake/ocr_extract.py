@@ -113,22 +113,22 @@ def _extract_text_with_paddle(pdf_path: Path) -> str:
 
 
 def extract_text_both(pdf_path: Path) -> dict:
-    """Extract text via embedded text layer and YOMITOKU (PaddleOCR optional).
+    """Extract text using YOMITOKU only (PDF embedded text disabled).
 
     Returns a dict with keys: text_pdf, text_yomitoku, text_combined.
 
-    text_combined always uses YOMITOKU output.
+    For compatibility, ``text_pdf`` is empty and ``text_combined`` equals
+    the YOMITOKU output.
     """
-    LOGGER.info("[OCR] begin extract_text_both: %s", pdf_path)
-    t_pdf = extract_text_from_pdf(pdf_path)
-    LOGGER.info("[OCR] pdfminer/PyPDF2 extracted: %d chars", len(t_pdf or ""))
+    LOGGER.info("[OCR] begin extract_text_both (YOMITOKU-only): %s", pdf_path)
+    # Embedded text is no longer used
+    t_pdf = ""
+    # Use YOMITOKU as the sole OCR source
     t_yomi = extract_text_with_yomitoku(pdf_path, ensure=True)
     LOGGER.info("[OCR] YOMITOKU extracted: %d chars", len(t_yomi or ""))
     if not (t_yomi and t_yomi.strip()):
         raise RuntimeError(
-            "YOMITOKU OCR is required but not available or produced no text. "
-            "Install and ensure 'yomitoku' CLI (or Python package) works. "
-            "You can set YOMITOKU_EXE to the CLI path."
+            "YOMITOKU OCR produced no text. Ensure YOMITOKU works and the document is readable."
         )
 
     t_combined = t_yomi
@@ -329,6 +329,17 @@ def _find_date_smart(text: str) -> Optional[str]:
                     d = _norm_date(y, mm, dd)
                     if d:
                         return d
+        # Generic Japanese date without label: YYYY年M月D日（曜日等の括弧は無視）
+        try:
+            pat_ja = re.compile(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+            for ln in lines:
+                m = pat_ja.search(ln)
+                if m:
+                    d = _norm_date(m.group(1), m.group(2), m.group(3))
+                    if d:
+                        return d
+        except Exception:
+            pass
         ignore = ("スキャン", "ScanSnap", "作成", "生成", "出力", "印刷", "保存", "アップロード", "download", "uploaded")
         generic = [
             re.compile(r"(20\d{2})[\-/\.](\d{1,2})[\-/\.](\d{1,2})"),
@@ -397,7 +408,7 @@ def _extract_counterparty_smart(text: str) -> str:
 
 def extract_journal_data(text: str) -> ParsedJournal:
     date = _find_date_smart(text)
-    amount = _find_amount_smart(text)
+    amount = _find_amount_best(text)
     debit, credit = _guess_accounts(text)
     counterparty = _extract_counterparty_smart(text)
     summary_parts = [p for p in [counterparty or None, "購入"] if p]
@@ -411,3 +422,143 @@ def extract_journal_data(text: str) -> ParsedJournal:
         counterparty=counterparty,
     )
 
+
+def _find_amount_best(text: str) -> Optional[int]:
+    """Improved chooser that prefers bottom-most cued totals and logs selection.
+
+    Falls back to existing smart and simple detectors if heuristics find nothing.
+    """
+    try:
+        import re as _re
+
+        # Label-aware extraction: remember last seen label and attach to amounts
+        total_labels = ("合計", "お買上げ合計", "お会計", "総計", "ご請求金額", "請求金額")
+        subtotal_labels = ("小計",)
+        tax_labels = ("消費税", "内消費税", "外税", "内税", "税")
+        recv_labels = ("お預り", "お預かり", "お支払い", "受領", "現金")
+        change_labels = ("お釣", "釣銭", "おつり")
+
+        excl = ("口座", "登録番号", "POS", "TEL", "電話", "FAX", "〒", "JAN", "コード", "Code", "No", "No.", "番号", "伝票", "注", "会員", "顧客")
+
+        def label_of(line: str) -> str | None:
+            l = line.replace(" ", "")
+            if any(k in l for k in total_labels) or _re.search(r"合.{0,2}計", l):
+                return "total"
+            if any(k in l for k in subtotal_labels):
+                return "subtotal"
+            if any(k in l for k in tax_labels):
+                return "tax"
+            if any(k in l for k in recv_labels):
+                return "recv"
+            if any(k in l for k in change_labels):
+                return "change"
+            return None
+
+        pat = _re.compile(r"([\-\u2212]?)\s*[¥\u00A5]?\s*([0-9]{1,3}(?:[, \u00A0][0-9]{3})+|[0-9]+)\s*(?:円?)")
+        lines = text.splitlines()
+        last_lab: str | None = None
+        labeled: list[dict] = []
+        for idx, line in enumerate(lines):
+            if any(k in line for k in excl):
+                # Skip obvious non-amount contexts entirely
+                continue
+            # Exclude likely phone numbers (e.g., 06-6774-4180)
+            try:
+                if _re.search(r"\b0\d{1,4}-\d{2,4}-\d{3,4}\b", line):
+                    continue
+            except Exception:
+                pass
+            lab = label_of(line) or last_lab
+            if label_of(line):
+                last_lab = label_of(line)
+            norm = _normalize_amount_text(line)
+            for m in pat.finditer(norm):
+                sign = m.group(1) or ""
+                num = m.group(2)
+                amt = _parse_int_amount(num, sign)
+                if amt == 0:
+                    continue
+                # Ignore quantities like "3個"等 when no currency symbol is present
+                if ("円" not in line and "¥" not in line and "￥" not in line) and any(u in line for u in ("個", "点", "枚", "本", "台")):
+                    continue
+                labeled.append({"idx": idx, "amount": amt, "label": lab, "line": line})
+
+        # If document mentions 合計金額 but no explicit total amount, sum item nets
+        try:
+            if any("合計金額" in l for l in lines) and not any(r.get("label") == "total" for r in labeled):
+                nets: list[int] = []
+                for i, ln in enumerate(lines):
+                    nn = _normalize_amount_text(ln)
+                    # Match numbers ending with 円 and not closed by ')'
+                    m_net = _re.search(r"([0-9]{1,3}(?:[, \u00A0][0-9]{3})+|[0-9]+)\s*円(?!\))", nn)
+                    if m_net:
+                        try:
+                            nets.append(int(_re.sub(r"\D", "", m_net.group(1))))
+                        except Exception:
+                            pass
+                if len(nets) >= 2:
+                    total_sum = sum(nets)
+                    try:
+                        LOGGER.info("[OCR] composed total from nets due to 合計金額: %s", total_sum)
+                    except Exception:
+                        pass
+                    return total_sum
+        except Exception:
+            pass
+
+        # Prefer explicit total → (subtotal+tax) → recent subtotal
+        totals = [r for r in labeled if r.get("label") == "total"]
+        if totals:
+            chosen = max(totals, key=lambda r: r["idx"])  # bottom-most total
+            try:
+                LOGGER.info("[OCR] amount chosen (label=total): %s from line: %s", chosen["amount"], chosen["line"][:120])
+            except Exception:
+                pass
+            return int(chosen["amount"]) if chosen else None
+
+        # Try to combine subtotal + tax when they appear
+        subs = [r for r in labeled if r.get("label") == "subtotal"]
+        taxes = [r for r in labeled if r.get("label") == "tax"]
+        if subs and taxes:
+            # Choose nearest pair (tax after subtotal within 5 lines, else last pair)
+            best = None
+            best_dist = 1e9
+            for s in subs:
+                for t in taxes:
+                    if t["idx"] >= s["idx"] and (t["idx"] - s["idx"]) <= 5:
+                        d = t["idx"] - s["idx"]
+                        if d < best_dist:
+                            best = (s, t)
+                            best_dist = d
+            if not best:
+                best = (subs[-1], taxes[-1])
+            s, t = best
+            gross = int(s["amount"]) + int(t["amount"])
+            try:
+                LOGGER.info("[OCR] amount composed from subtotal+tax: %s + %s = %s", s["amount"], t["amount"], gross)
+            except Exception:
+                pass
+            return gross
+
+        if subs:
+            # If we only see subtotal (and items marked as 込), subtotal is likely gross
+            chosen = subs[-1]
+            try:
+                LOGGER.info("[OCR] amount chosen (label=subtotal): %s from line: %s", chosen["amount"], chosen["line"][:120])
+            except Exception:
+                pass
+            return int(chosen["amount"]) if chosen else None
+
+        # As a last resort, pick the last yen-amount (line contains 円/¥) not labeled as recv/change/tax
+        fallback = [r for r in labeled if r.get("label") not in ("recv", "change", "tax") and ("円" in r.get("line","") or "¥" in r.get("line","") or "￥" in r.get("line",""))]
+        if fallback:
+            chosen = fallback[-1]
+            try:
+                LOGGER.info("[OCR] amount chosen (fallback): %s from line: %s", chosen["amount"], chosen["line"][:120])
+            except Exception:
+                pass
+            return int(chosen["amount"]) if chosen else None
+    except Exception:
+        pass
+    # Fallback to existing detectors
+    return _find_amount_smart(text) or _find_amount(text)

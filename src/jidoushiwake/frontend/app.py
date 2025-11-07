@@ -585,7 +585,12 @@ class AccountCellDelegate(QStyledItemDelegate):
             # attach completer to the lineEdit with [name, token]
             le = combo.lineEdit()
             if le is not None:
+                # Give QObject parents to keep them alive beyond this method
                 model = QStandardItemModel()
+                try:
+                    model.setParent(combo)
+                except Exception:
+                    pass
                 rev: dict[str, set[str]] = {n: set() for n in self._names}
                 for tok, nm in self._tok_map.items():
                     if nm in rev and tok:
@@ -597,7 +602,15 @@ class AccountCellDelegate(QStyledItemDelegate):
                             model.appendRow([QStandardItem(nm), QStandardItem(t)])
                     else:
                         model.appendRow([QStandardItem(nm), QStandardItem("")])
-                comp = QCompleter(model)
+                # Parent the completer to the editor to ensure proper lifetime
+                try:
+                    comp = QCompleter(model, le)
+                except Exception:
+                    comp = QCompleter(model)
+                try:
+                    comp.setParent(le)
+                except Exception:
+                    pass
                 comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
                 try:
                     comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
@@ -616,7 +629,17 @@ class AccountCellDelegate(QStyledItemDelegate):
                     comp.popup().setItemDelegate(_AccountListDelegate(None, comp.popup()))
                 except Exception:
                     pass
-                le.setCompleter(comp)
+                try:
+                    le.setCompleter(comp)
+                except RuntimeError:
+                    # If editor got destroyed prematurely, avoid bubbling up
+                    return combo
+                # Keep strong references to avoid GC collecting model/completer
+                try:
+                    setattr(le, "_jidou_completer", comp)
+                    setattr(le, "_jidou_completer_model", model)
+                except Exception:
+                    pass
                 # on choose, set JP name to combo
                 def _on_idx(idx):
                     try:
