@@ -1081,6 +1081,69 @@ class _AccountDelegate(QStyledItemDelegate):
         super().setModelData(editor, model, index)
 
 
+class DateCellDelegate(QStyledItemDelegate):
+    """Date editor for the grid's date column using QDateEdit with calendar popup.
+
+    Accepts text in common formats like 'YYYY/MM/DD', 'YYYY-MM-DD', 'YYYY.MM.DD',
+    and a shorthand 'MMDD' (e.g., '0930' -> current year/09/30). Saves as 'YYYY/MM/DD'.
+    """
+
+    def createEditor(self, parent, option, index):  # type: ignore[override]
+        try:
+            from PyQt6.QtCore import QDate
+        except Exception:
+            return super().createEditor(parent, option, index)
+        ed = QDateEdit(parent)
+        ed.setCalendarPopup(True)
+        ed.setDisplayFormat("yyyy/MM/dd")
+        try:
+            ed.setDate(QDate.currentDate())
+        except Exception:
+            pass
+        return ed
+
+    def setEditorData(self, editor, index):  # type: ignore[override]
+        try:
+            from PyQt6.QtCore import QDate
+        except Exception:
+            return super().setEditorData(editor, index)
+        if isinstance(editor, QDateEdit):
+            txt = str(index.data() or "").strip()
+            dt = None
+            # Try YYYY sep MM sep DD
+            for sep in ("/", "-", "."):
+                parts = txt.split(sep)
+                if len(parts) == 3 and all(p.isdigit() for p in parts):
+                    y, m, d = [int(p) for p in parts]
+                    dt = QDate(y, m, d)
+                    break
+            # Shorthand MMDD
+            if dt is None and len(txt) == 4 and txt.isdigit():
+                today = QDate.currentDate()
+                y = today.year()
+                m = int(txt[:2]); d = int(txt[2:])
+                dt = QDate(y, m, d)
+            if dt is None:
+                dt = QDate.currentDate()
+            try:
+                editor.setDate(dt)
+            except Exception:
+                pass
+        else:
+            super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index):  # type: ignore[override]
+        if isinstance(editor, QDateEdit):
+            try:
+                dt = editor.date()  # type: ignore[attr-defined]
+                text = dt.toString("yyyy/MM/dd") if dt.isValid() else ""
+            except Exception:
+                text = ""
+            model.setData(index, text)
+        else:
+            super().setModelData(editor, model, index)
+
+
 def _detect_account_columns(tbl: 'QTableWidget') -> list[int]:  # type: ignore[name-defined]
     cols: list[int] = []
     try:
@@ -2064,10 +2127,14 @@ class ReviewPage(QWidget):
         )
         self.table.itemSelectionChanged.connect(self._on_table_select)  # type: ignore[arg-type]
         self.table.itemChanged.connect(self._on_item_changed)  # type: ignore[arg-type]
-        # Install delegates and visible dropdowns directly on this table (debit=1, credit=3)
+        # Install delegates: date (0) uses calendar popup; accounts (1,3) use searchable dropdown
         try:
             names, token_map = _load_account_catalog()
             if names:
+                try:
+                    self.table.setItemDelegateForColumn(0, DateCellDelegate(self.table))
+                except Exception:
+                    pass
                 delegate = AccountCellDelegate(names, token_map, self.table)
                 try:
                     self.table.setItemDelegateForColumn(1, delegate)
@@ -3162,6 +3229,11 @@ class MainWindow(QMainWindow):
             names, token_map = _load_account_catalog()
             if names and hasattr(self, 'review_page'):
                 for tbl in getattr(self.review_page, 'findChildren', lambda *_: [])(QTableWidget):  # type: ignore[name-defined]
+                    try:
+                        # Date column calendar
+                        tbl.setItemDelegateForColumn(0, DateCellDelegate(tbl))
+                    except Exception:
+                        pass
                     try:
                         delegate = AccountCellDelegate(names, token_map, tbl)
                         tbl.setItemDelegateForColumn(1, delegate)

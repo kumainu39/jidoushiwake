@@ -113,31 +113,61 @@ def _extract_text_with_paddle(pdf_path: Path) -> str:
 
 
 def extract_text_both(pdf_path: Path) -> dict:
-    """Extract text using YOMITOKU only (PDF embedded text disabled).
+    """Extract text with graceful fallbacks.
+
+    Order of preference:
+    1) YOMITOKU (CLI or package)
+    2) PaddleOCR rasterized from PDF pages
+    3) Embedded PDF text (pdfminer/PyPDF2)
 
     Returns a dict with keys: text_pdf, text_yomitoku, text_combined.
-
-    For compatibility, ``text_pdf`` is empty and ``text_combined`` equals
-    the YOMITOKU output.
     """
-    LOGGER.info("[OCR] begin extract_text_both (YOMITOKU-only): %s", pdf_path)
-    # Embedded text is no longer used
-    t_pdf = ""
-    # Use YOMITOKU as the sole OCR source
-    t_yomi = extract_text_with_yomitoku(pdf_path, ensure=True)
-    LOGGER.info("[OCR] YOMITOKU extracted: %d chars", len(t_yomi or ""))
-    if not (t_yomi and t_yomi.strip()):
-        raise RuntimeError(
-            "YOMITOKU OCR produced no text. Ensure YOMITOKU works and the document is readable."
-        )
+    LOGGER.info("[OCR] begin extract_text_both: %s", pdf_path)
 
-    t_combined = t_yomi
+    t_pdf = ""
+    t_yomi = ""
+    t_paddle = ""
+
+    # 1) Try YOMITOKU first, but do not crash if empty
+    try:
+        t_yomi = extract_text_with_yomitoku(pdf_path, ensure=False)
+    except Exception as e:
+        LOGGER.warning("[OCR] YOMITOKU failed: %s", e)
+        t_yomi = ""
+    LOGGER.info("[OCR] YOMITOKU extracted: %d chars", len(t_yomi or ""))
+
+    # 2) If YOMITOKU empty, try PaddleOCR
+    if not (t_yomi and t_yomi.strip()):
+        try:
+            t_paddle = _extract_text_with_paddle(pdf_path)
+        except Exception as e:
+            LOGGER.warning("[OCR] PaddleOCR fallback failed: %s", e)
+            t_paddle = ""
+        LOGGER.info("[OCR] PaddleOCR extracted: %d chars", len(t_paddle or ""))
+
+    # 3) As a last resort, try embedded PDF text
+    if not (t_yomi and t_yomi.strip()) and not (t_paddle and t_paddle.strip()):
+        try:
+            t_pdf = extract_text_from_pdf(pdf_path)
+        except Exception as e:
+            LOGGER.warning("[OCR] PDF text fallback failed: %s", e)
+            t_pdf = ""
+        LOGGER.info("[OCR] PDF embedded extracted: %d chars", len(t_pdf or ""))
+
+    # Choose best available for combined
+    t_combined = (t_yomi or t_paddle or t_pdf or "")
 
     result = {
         "text_pdf": t_pdf,
         "text_yomitoku": t_yomi,
         "text_combined": t_combined,
     }
+    # Optionally include Paddle text for future use
+    try:
+        result["text_paddle"] = t_paddle
+    except Exception:
+        pass
+
     LOGGER.info("[OCR] combined length: %d", len(t_combined or ""))
     return result
 

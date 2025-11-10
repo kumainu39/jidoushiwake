@@ -235,7 +235,15 @@ class ReviewPage(QWidget):
         center.addWidget(self.preview)
         # right: form
         form = QFormLayout()
-        self.date = QLineEdit()
+        from PyQt6.QtWidgets import QDateEdit
+        from PyQt6.QtCore import QDate
+        self.date = QDateEdit()
+        try:
+            self.date.setCalendarPopup(True)
+            self.date.setDisplayFormat("yyyy/MM/dd")
+            self.date.setDate(QDate.currentDate())
+        except Exception:
+            pass
         self.amount = QLineEdit()
         self.summary = QLineEdit()
         self.debit = QLineEdit()
@@ -294,7 +302,20 @@ class ReviewPage(QWidget):
         data = items[0].data(Qt.ItemDataRole.UserRole) or {}
         self.current_id = int(data.get("id"))
         auto = data.get("auto") or {}
-        self.date.setText(auto.get("date") or "")
+        try:
+            from PyQt6.QtCore import QDate
+            d = (auto.get("date") or "").strip()
+            if d and "/" in d:
+                y, m, da = [int(x) for x in d.split("/")]
+                self.date.setDate(QDate(y, m, da))
+            else:
+                self.date.setDate(QDate.currentDate())
+        except Exception:
+            try:
+                from PyQt6.QtCore import QDate
+                self.date.setDate(QDate.currentDate())
+            except Exception:
+                pass
         self.amount.setText(str(auto.get("amount")) if auto.get("amount") is not None else "")
         self.summary.setText(auto.get("summary") or "")
         self.debit.setText(auto.get("debit_account") or "")
@@ -321,7 +342,7 @@ class ReviewPage(QWidget):
         if not self.current_id:
             return
         payload = {
-            "date": (self.date.text() or None),
+            "date": (self.date.date().toString("yyyy/MM/dd") if hasattr(self.date, 'date') else None),
             "amount": int(self.amount.text()) if (self.amount.text() or "").strip().isdigit() else None,
             "summary": (self.summary.text() or None),
             "debit_account": (self.debit.text() or None),
@@ -548,4 +569,3 @@ def run_ui() -> None:
 
 if __name__ == "__main__":
     run_ui()
-
