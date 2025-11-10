@@ -1100,6 +1100,47 @@ class DateCellDelegate(QStyledItemDelegate):
             ed.setDate(QDate.currentDate())
         except Exception:
             pass
+
+        # Add a small ■ button into the calendar popup's navigation bar
+        try:
+            cal = ed.calendarWidget()
+            if cal is not None:
+                nav = cal.findChild(QWidget, "qt_calendar_navigationbar") or cal.findChild(QWidget, "qt_calendar_navbar")
+                if nav is not None:
+                    # Avoid duplicates
+                    existing = nav.findChild(QPushButton, "calendar_jump_today")
+                    if existing is None:
+                        btn = QPushButton("■", nav)
+                        btn.setObjectName("calendar_jump_today")
+                        btn.setToolTip("今日へ")
+                        btn.setFixedWidth(18)
+                        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                        if nav.layout() is None:
+                            lay = QHBoxLayout(nav)
+                            lay.setContentsMargins(2, 2, 2, 2)
+                            lay.setSpacing(4)
+                        lay = nav.layout()
+                        lay.addWidget(btn)
+
+                        def _jump_today():
+                            try:
+                                today = QDate.currentDate()
+                                cal.setSelectedDate(today)
+                                try:
+                                    ed.setDate(today)
+                                except Exception:
+                                    pass
+                                try:
+                                    cal.showToday()
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+
+                        btn.clicked.connect(_jump_today)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
         return ed
 
     def setEditorData(self, editor, index):  # type: ignore[override]
@@ -1107,7 +1148,14 @@ class DateCellDelegate(QStyledItemDelegate):
             from PyQt6.QtCore import QDate
         except Exception:
             return super().setEditorData(editor, index)
-        if isinstance(editor, QDateEdit):
+        # Support both bare QDateEdit and our wrapped container
+        target = editor
+        if not isinstance(editor, QDateEdit):
+            try:
+                target = getattr(editor, "_date_edit", editor)
+            except Exception:
+                target = editor
+        if isinstance(target, QDateEdit):
             txt = str(index.data() or "").strip()
             dt = None
             # Try YYYY sep MM sep DD
@@ -1126,16 +1174,23 @@ class DateCellDelegate(QStyledItemDelegate):
             if dt is None:
                 dt = QDate.currentDate()
             try:
-                editor.setDate(dt)
+                target.setDate(dt)
             except Exception:
                 pass
         else:
             super().setEditorData(editor, index)
 
     def setModelData(self, editor, model, index):  # type: ignore[override]
-        if isinstance(editor, QDateEdit):
+        # Support both bare QDateEdit and our wrapped container
+        target = editor
+        if not isinstance(editor, QDateEdit):
             try:
-                dt = editor.date()  # type: ignore[attr-defined]
+                target = getattr(editor, "_date_edit", editor)
+            except Exception:
+                target = editor
+        if isinstance(target, QDateEdit):
+            try:
+                dt = target.date()  # type: ignore[attr-defined]
                 text = dt.toString("yyyy/MM/dd") if dt.isValid() else ""
             except Exception:
                 text = ""

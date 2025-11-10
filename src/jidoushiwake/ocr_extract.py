@@ -220,7 +220,81 @@ def _norm_date(y: str, m: str, d: str) -> Optional[str]:
         return None
 
 
+# ---- Japanese era (和暦) support ----
+# Full-width to half-width translation for digits and common separators used in dates
+_DATE_FW_TO_HW = str.maketrans({
+    "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+    "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+    "／": "/", "．": ".", "－": "-", "ー": "-", "―": "-",
+    "年": "年", "月": "月", "日": "日", "Ｒ": "R", "Ｈ": "H", "Ｓ": "S", "Ｔ": "T", "Ｍ": "M",
+})
+
+# Era to Gregorian base year mapping (first year of era)
+_ERA_BASE = {
+    "令和": 2019,
+    "平成": 1989,
+    "昭和": 1926,
+    "大正": 1912,
+    "明治": 1868,
+    "R": 2019,
+    "H": 1989,
+    "S": 1926,
+    "T": 1912,
+    "M": 1868,
+}
+
+def _normalize_date_text(s: str) -> str:
+    try:
+        s = s.translate(_DATE_FW_TO_HW)
+        s = re.sub(r"\s*([/\.\-年月日])\s*", r"\1", s)
+    except Exception:
+        pass
+    return s
+
+def _wareki_to_ymd(era: str, year_text: str, month_text: str, day_text: str) -> Optional[str]:
+    try:
+        base = _ERA_BASE.get(era)
+        if base is None:
+            return None
+        y = 1 if year_text in ("元", "元年") else int(year_text)
+        g = base + y - 1
+        return _norm_date(str(g), month_text, day_text)
+    except Exception:
+        return None
+
+def _find_date_wareki(text: str) -> Optional[str]:
+    """Find a date written in Japanese era (和暦) and convert to YYYY/MM/DD."""
+    try:
+        lines = [_normalize_date_text(ln.strip()) for ln in text.splitlines() if ln.strip()]
+        pat_kanji = re.compile(r"(令和|平成|昭和|大正|明治)(元|\d{1,2})年(\d{1,2})月(\d{1,2})日?")
+        pat_kanji_sep = re.compile(r"(令和|平成|昭和|大正|明治)(元|\d{1,2})[/.\-](\d{1,2})[/.\-](\d{1,2})")
+        pat_initial = re.compile(r"([RrHhSsTtMm])\.?\s*(\d{1,2})[/.\-年](\d{1,2})[/.\-月](\d{1,2})日?")
+        for ln in lines:
+            m = pat_kanji.search(ln)
+            if m:
+                d = _wareki_to_ymd(m.group(1), m.group(2), m.group(3), m.group(4))
+                if d:
+                    return d
+            m = pat_kanji_sep.search(ln)
+            if m:
+                d = _wareki_to_ymd(m.group(1), m.group(2), m.group(3), m.group(4))
+                if d:
+                    return d
+            m = pat_initial.search(ln)
+            if m:
+                era = m.group(1).upper()
+                d = _wareki_to_ymd(era, m.group(2), m.group(3), m.group(4))
+                if d:
+                    return d
+    except Exception:
+        pass
+    return None
+
 def _find_date(text: str) -> Optional[str]:
+    # Try era-based date first
+    d_era = _find_date_wareki(text)
+    if d_era:
+        return d_era
     for pat in DATE_PATTERNS:
         m = pat.search(text)
         if not m:
@@ -346,6 +420,10 @@ def _extract_counterparty(text: str) -> str:
 # Improved helpers: smarter date/amount/counterparty detection
 def _find_date_smart(text: str) -> Optional[str]:
     try:
+        # If the document uses Japanese era dates, convert first
+        d_era_all = _find_date_wareki(text)
+        if d_era_all:
+            return d_era_all
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         labeled = [
             re.compile(r"(発行日|ご請求日|請求日|ご利用日|利用日|購入日|お買上日|領収日|取引日|注文日|納品日|日付)[:：]?\s*(\d{4})[\./年／\-](\d{1,2})[\./月／\-](\d{1,2})日?"),
