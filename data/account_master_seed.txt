@@ -197,3 +197,8 @@
 法人税等調整額 HOJINZEI 981  
 法人税、住民税及び事業税 HOJINZEI 982 
 
+
+# romaji synonyms
+���ʗa�� futsuyo FUTSUYO
+��c�� kaigi KAIGI
+���Օi shomohin SHOMOHIN
