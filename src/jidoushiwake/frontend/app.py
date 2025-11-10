@@ -2168,6 +2168,22 @@ class ReviewPage(QWidget):
             "摘要\n（税区分）",
             "請求書区分\n",
         ])
+        # Ensure two-line headers for account columns
+        try:
+            from PyQt6.QtWidgets import QTableWidgetItem
+            _hdr_labels = [
+                "日付",
+                "借方勘定科目\n（補助科目）",
+                "借方金額",
+                "貸方勘定科目\n（補助科目）",
+                "貸方金額",
+                "摘要",
+                "請求書区分",
+            ]
+            for _i, _t in enumerate(_hdr_labels):
+                self.table.setHorizontalHeaderItem(_i, QTableWidgetItem(_t))
+        except Exception:
+            pass
         self.table.horizontalHeader().setStretchLastSection(True)
         try:
             # make header tall enough to show two lines
