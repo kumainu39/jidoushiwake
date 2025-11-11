@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QBrush, QColor, QPixmap, QImage
+from PyQt6.QtGui import QAction, QBrush, QColor, QPixmap, QImage, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -57,7 +57,7 @@ def _load_ui_settings() -> dict:
         "pdf_label_min_width": 480,
         "pdf_label_max_width": 0,  # 0 = no limit
         "pdf_fixed_width": 420,
-        "pdf_scale_ratio": 1.25,
+        "pdf_scale_ratio": 1.0,
         "pdf_scale_ratio_min": 0.0,
         "pdf_scale_ratio_max": 2.0,
         "pdf_max_width_px": 0,  # 0 = auto
@@ -2139,8 +2139,41 @@ class ReviewPage(QWidget):
             pass
         # 以降のスケーリングは設定値を基準に行う
         self._pdf_fixed_width = int(UI_SETTINGS.get("pdf_fixed_width", 420))
-        self._pdf_scale_ratio = float(UI_SETTINGS.get("pdf_scale_ratio", 1.25))
-        left.addWidget(self.pdf_label, 3)
+        self._pdf_scale_ratio = float(UI_SETTINGS.get("pdf_scale_ratio", 1.0))
+        self._default_pdf_ratio = float(UI_SETTINGS.get("pdf_scale_ratio", 1.0))
+        # ユーザーがズーム操作したかのフラグ（True なら枠をはみ出してもスクロール許可）
+        self._manual_zoom = False
+        # Put PDF label inside its own scroll area so zoom overflow scrolls
+        self.pdf_scroll = QScrollArea()
+        try:
+            self.pdf_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.pdf_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        except Exception:
+            pass
+        self.pdf_scroll.setWidget(self.pdf_label)
+        # For manual zoom, we will toggle widgetResizable(False) for natural-size scrolling
+        self.pdf_scroll.setWidgetResizable(False)
+        left.addWidget(self.pdf_scroll, 3)
+
+        # Zoom controls next to PDF frame
+        self.zoom_out_btn = QPushButton("縮小")
+        self.zoom_in_btn = QPushButton("拡大")
+        self.zoom_reset_btn = QPushButton("等倍")
+        self.zoom_auto_btn = QPushButton("自動フィット")
+        self.zoom_label = QLabel("100%")
+        try:
+            self.zoom_out_btn.clicked.connect(lambda: self._change_zoom(-0.1))  # type: ignore[arg-type]
+            self.zoom_in_btn.clicked.connect(lambda: self._change_zoom(0.1))   # type: ignore[arg-type]
+            self.zoom_reset_btn.clicked.connect(lambda: self._set_zoom(1.0))   # type: ignore[arg-type]
+            self.zoom_auto_btn.clicked.connect(self._auto_fit)                 # type: ignore[arg-type]
+        except Exception:
+            pass
+        pdf_zoom_row = QHBoxLayout()
+        pdf_zoom_row.addStretch(1)
+        pdf_zoom_row.addWidget(self.zoom_out_btn)
+        pdf_zoom_row.addWidget(self.zoom_label)
+        pdf_zoom_row.addWidget(self.zoom_in_btn)
+        left.addLayout(pdf_zoom_row)
 
         nl_group = QGroupBox("自然言語の指示（修正/仕訳）")
         try:
@@ -2199,6 +2232,9 @@ class ReviewPage(QWidget):
             pass
         left_scroll = QScrollArea(); left_scroll.setWidgetResizable(True)
         left_scroll.setWidget(left_container)
+        # Keep references for zoom behavior switching
+        self._left_scroll = left_scroll
+        self._left_container = left_container
         try:
             left_scroll.setMinimumWidth(int(UI_SETTINGS.get("left_scroll_min_width", 480)))
             mx = int(UI_SETTINGS.get("left_scroll_max_width", 0))
@@ -2207,13 +2243,18 @@ class ReviewPage(QWidget):
         except Exception:
             pass
         try:
-            left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         except Exception:
             pass
         # ビューポートのリサイズに追従してPDFのスケールを調整
         try:
             left_scroll.viewport().installEventFilter(self)
+        except Exception:
+            pass
+        try:
+            # Also resize on PDF viewport changes (e.g., splitter adjustments)
+            self.pdf_scroll.viewport().installEventFilter(self)
         except Exception:
             pass
 
@@ -2311,6 +2352,11 @@ class ReviewPage(QWidget):
         util_row.addWidget(self.pdf_prev)
         util_row.addWidget(self.pdf_page_label)
         util_row.addWidget(self.pdf_next)
+        # Place reset/auto-fit back on the right utility row
+        util_row.addSpacing(8)
+        util_row.addWidget(self.zoom_reset_btn)
+        util_row.addWidget(self.zoom_auto_btn)
+
         util_row.addWidget(self.page_prev)
         util_row.addWidget(self.page_label)
         util_row.addWidget(self.page_next)
@@ -2320,6 +2366,25 @@ class ReviewPage(QWidget):
         right.addLayout(util_row)
         right.addWidget(self.table)
         right_wrap = QWidget(); right_wrap.setLayout(right)
+
+        # Keyboard shortcuts for zoom
+        try:
+            QShortcut(QKeySequence.StandardKey.ZoomIn, self, activated=lambda: self._change_zoom(0.1))
+            QShortcut(QKeySequence.StandardKey.ZoomOut, self, activated=lambda: self._change_zoom(-0.1))
+        except Exception:
+            try:
+                QShortcut(QKeySequence("Ctrl++"), self, activated=lambda: self._change_zoom(0.1))
+                QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self._change_zoom(-0.1))
+            except Exception:
+                pass
+
+        # Initialize zoom label from current ratio without forcing a re-render
+        try:
+            current_ratio = float(getattr(self, "_pdf_scale_ratio", 1.0))
+            if hasattr(self, 'zoom_label') and isinstance(self.zoom_label, QLabel):
+                self.zoom_label.setText(f"{int(current_ratio * 100)}%")
+        except Exception:
+            pass
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         # 全画面時に左ペインが潰れてNL入力欄が見えなくなるのを防止
@@ -2784,20 +2849,15 @@ class ReviewPage(QWidget):
             pm = QPixmap.fromImage(img)
             # ビューポート幅×倍率(既定1.25)を狙いつつ、縦スクロールが出ないよう高さ制約も反映
             try:
-                vp = None
-                # 直近で作ったスクロールを検索
-                p = self.pdf_label.parent()
-                while p is not None and not isinstance(p, QScrollArea):
-                    p = p.parent()
-                if isinstance(p, QScrollArea):
-                    vp = p.viewport()
+                vp = getattr(self, 'pdf_scroll', None)
+                vp = vp.viewport() if vp is not None else None
                 avail_w = vp.width() if vp is not None else self.pdf_label.width()
                 avail_h = vp.height() if vp is not None else self.pdf_label.height()
             except Exception:
                 avail_w = self.pdf_label.width()
                 avail_h = self.pdf_label.height()
             try:
-                ratio = float(getattr(self, "_pdf_scale_ratio", 1.25))
+                ratio = float(getattr(self, "_pdf_scale_ratio", 1.0))
                 # 設定による下限/上限
                 rmin = float(UI_SETTINGS.get("pdf_scale_ratio_min", 0.0))
                 rmax = float(UI_SETTINGS.get("pdf_scale_ratio_max", 0.0))
@@ -2807,7 +2867,8 @@ class ReviewPage(QWidget):
                     ratio = min(rmax, ratio)
             except Exception:
                 ratio = 1.25
-            # 希望倍率(1.25)を優先しつつ、ビューポート幅の98%を上限にして横スクロールを回避
+            # 希望倍率(既定1.25)を優先。ユーザーがズーム操作した場合は枠超過を許容しスクロールで対応
+            manual = bool(getattr(self, "_manual_zoom", False))
             fixed_min = getattr(self, "_pdf_fixed_width", 420)
             desired_w = int(avail_w * ratio)
             max_w_by_width = int(avail_w * 0.98)
@@ -2837,26 +2898,56 @@ class ReviewPage(QWidget):
             except Exception:
                 max_w_by_height = max_w_by_width
             hard_max_w = max(100, min(max_w_by_width, max_w_by_height))
-            # 追加の上限（絶対px）
-            try:
-                max_px = int(UI_SETTINGS.get("pdf_max_width_px", 0))
-                if max_px and max_px > 0:
-                    hard_max_w = min(hard_max_w, max_px)
-            except Exception:
-                pass
-            target = int(max(fixed_min, min(desired_w, hard_max_w)))
-            w = max(320, target)
-            # 高さの上限に確実に収めるため、幅と高さの両方を指定したスケールを用いる
-            try:
-                from PyQt6.QtCore import Qt as _Qt
-                pm = pm.scaled(w, int(allowed_h), _Qt.AspectRatioMode.KeepAspectRatio, _Qt.TransformationMode.SmoothTransformation)
-            except Exception:
-                pm = pm.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
-            # ラベル自体の高さ上限も設定して、NL欄が初期から見えるようにする
-            try:
-                self.pdf_label.setMaximumHeight(int(allowed_h))
-            except Exception:
-                pass
+            if manual:
+                # ユーザーの明示ズーム: ビューポート制約を外し、スクロール前提で幅優先
+                try:
+                    sc = getattr(self, '_left_scroll', None)
+                    if sc is not None:
+                        sc.setWidgetResizable(False)
+                except Exception:
+                    pass
+                # 100% = レンダリング基準ピクセル幅
+                base_w = int(pm.width())
+                w = max(1, int(base_w * max(0.1, ratio)))
+                try:
+                    from PyQt6.QtCore import Qt as _Qt
+                    pm = pm.scaledToWidth(w, _Qt.TransformationMode.SmoothTransformation)
+                except Exception:
+                    pm = pm.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
+                try:
+                    # 無制限に戻す（Qt のデフォルト最大値）
+                    self.pdf_label.setMaximumHeight(16777215)
+                    # ラベル最小サイズをピクセルに合わせ、スクロールを促す
+                    self.pdf_label.setMinimumSize(pm.width(), pm.height())
+                except Exception:
+                    pass
+            else:
+                # 自動フィット: 横スクロール回避、縦はNL欄確保
+                try:
+                    sc = getattr(self, '_left_scroll', None)
+                    if sc is not None:
+                        sc.setWidgetResizable(True)
+                except Exception:
+                    pass
+                # 追加の上限（絶対px）
+                try:
+                    max_px = int(UI_SETTINGS.get("pdf_max_width_px", 0))
+                    if max_px and max_px > 0:
+                        hard_max_w = min(hard_max_w, max_px)
+                except Exception:
+                    pass
+                target = int(max(fixed_min, min(desired_w, hard_max_w)))
+                w = max(320, target)
+                try:
+                    from PyQt6.QtCore import Qt as _Qt
+                    pm = pm.scaled(w, int(allowed_h), _Qt.AspectRatioMode.KeepAspectRatio, _Qt.TransformationMode.SmoothTransformation)
+                except Exception:
+                    pm = pm.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
+                try:
+                    self.pdf_label.setMaximumHeight(int(allowed_h))
+                    self.pdf_label.setMinimumSize(0, 0)
+                except Exception:
+                    pass
             self.pdf_label.setPixmap(pm)
             # Update intra-PDF page position label (keep doc navigation label separate)
             try:
@@ -2889,6 +2980,49 @@ class ReviewPage(QWidget):
             self._show_pdf(self._pdf_path)
         except Exception:
             pass
+
+    def _set_zoom(self, ratio: float) -> None:
+        try:
+            rmin = float(UI_SETTINGS.get("pdf_scale_ratio_min", 0.0))
+            rmax = float(UI_SETTINGS.get("pdf_scale_ratio_max", 0.0))
+        except Exception:
+            rmin = 0.0
+            rmax = 0.0
+        # Fallback bounds if settings are unset
+        if not rmin:
+            rmin = 0.1
+        if not rmax:
+            rmax = 5.0
+        ratio = max(rmin, min(float(ratio), rmax))
+        self._pdf_scale_ratio = ratio
+        # ユーザー操作によるズームを有効化（スクロール許容）
+        self._manual_zoom = True
+        try:
+            if hasattr(self, 'zoom_label'):
+                self.zoom_label.setText(f"{int(ratio * 100)}%")
+        except Exception:
+            pass
+        if getattr(self, "_pdf_path", None):
+            self._show_pdf(self._pdf_path)
+
+    def _change_zoom(self, delta: float) -> None:
+        current = float(getattr(self, "_pdf_scale_ratio", 1.25))
+        self._set_zoom(current + float(delta))
+
+    def _auto_fit(self) -> None:
+        # Return to auto-fit mode using default ratio
+        try:
+            self._pdf_scale_ratio = float(getattr(self, "_default_pdf_ratio", 1.0))
+        except Exception:
+            self._pdf_scale_ratio = 1.0
+        self._manual_zoom = False
+        try:
+            if hasattr(self, 'zoom_label'):
+                self.zoom_label.setText(f"{int(self._pdf_scale_ratio * 100)}%")
+        except Exception:
+            pass
+        if getattr(self, "_pdf_path", None):
+            self._show_pdf(self._pdf_path)
 
     # ビューポート/ウィンドウのリサイズでプレビューを再スケール
     def eventFilter(self, obj, event):  # type: ignore[override]

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import uvicorn
 
 from src.jidoushiwake.api.app import app
 # ユーザー提供の最新UI（app.py）を使用
 from src.jidoushiwake.frontend.app import run_ui
+from src.jidoushiwake.logging_utils import setup_logging
 
 
 def start_api() -> None:
@@ -22,6 +24,9 @@ def start_api() -> None:
 
 
 if __name__ == "__main__":
+    # Enable both console and file logging for terminal visibility
+    setup_logging(Path("logs") / "app.log")
+
     t = threading.Thread(target=start_api, daemon=True)
     t.start()
     run_ui()

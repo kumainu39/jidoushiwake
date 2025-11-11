@@ -1,6 +1,5 @@
 import argparse
 import logging
-from logging.handlers import RotatingFileHandler
 import re
 import sys
 from dataclasses import dataclass
@@ -27,17 +26,38 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 
 def setup_logging() -> None:
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+    # Unified logging: file + console
+    try:
+        from jidoushiwake.logging_utils import setup_logging as _setup
 
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=512_000, backupCount=3, encoding="utf-8")
+        _setup(LOG_FILE, level=logging.INFO, max_bytes=512_000, backup_count=3)
+        return
+    except Exception:
+        pass
+
+    # Fallback: basic console + rotating file
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
     fmt = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    handler.setFormatter(fmt)
-    logger.addHandler(handler)
+    # Console
+    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
+    # Rotating file
+    try:
+        from logging.handlers import RotatingFileHandler
+
+        if not any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+            fh = RotatingFileHandler(LOG_FILE, maxBytes=512_000, backupCount=3, encoding="utf-8")
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+    except Exception:
+        pass
 
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
@@ -334,4 +354,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
