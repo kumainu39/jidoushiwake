@@ -204,6 +204,13 @@ TEXT = r"""
 法人税等 HOJINZEI 980  
 法人税等調整額 HOJINZEI 981  
 法人税、住民税及び事業税 HOJINZEI 982 
+
+製造原価
+[製]仕入 seizoSHIIREDA 1100
+[製]外注費 seizoGAICHUHI 1101
+[製]労務費 seizoROMUHI 1102
+[製]経費 seizoKEIHI 1103
+[製]減価償却費 seizoGENKASHO 1104
 """
 
 

@@ -1864,13 +1864,16 @@ class ScanPage(QWidget):
 
         import_btn = QPushButton("PDF取込")
         import_dir_btn = QPushButton("フォルダ取込")
+        import_csv_btn = QPushButton("CSV/Excel取込")
         import_btn.clicked.connect(self.import_pdfs)  # type: ignore[arg-type]
         import_dir_btn.clicked.connect(self.import_folder)  # type: ignore[arg-type]
+        import_csv_btn.clicked.connect(self.import_csv_excel)  # type: ignore[arg-type]
         self.list_widget = QListWidget()
 
         row = QHBoxLayout()
         row.addWidget(import_btn)
         row.addWidget(import_dir_btn)
+        row.addWidget(import_csv_btn)
         layout.addLayout(row)
         layout.addWidget(QLabel("未確認データ"))
         layout.addWidget(self.list_widget)
@@ -1965,6 +1968,65 @@ class ScanPage(QWidget):
             pass
         try:
             self.scan_status.setText(f"フォルダ取込 完了: {imported} 件")
+        except Exception:
+            pass
+
+    def import_csv_excel(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "CSV/Excelを選択",
+            str(Path.cwd()),
+            "CSV/Excel Files (*.csv *.tsv *.xlsx *.xls)"
+        )
+        if not files:
+            return
+        prog = QProgressDialog("取り込み中...", "中止", 0, len(files), self)
+        prog.setWindowTitle("CSV/Excel取込 進捗")
+        prog.setAutoClose(True); prog.setAutoReset(True)
+        imported = 0
+        for i, f in enumerate(files):
+            try:
+                suf = Path(f).suffix.lower()
+                mime = (
+                    "text/tab-separated-values" if suf == ".tsv" else
+                    "text/csv" if suf == ".csv" else
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if suf == ".xlsx" else
+                    "application/vnd.ms-excel"
+                )
+                with open(f, "rb") as fh:
+                    files_ = {"file": (Path(f).name, fh, mime)}
+                    data = {"company_name": self.company}
+                    r = requests.post(f"{API_URL}/transactions/import", data=data, files=files_, timeout=120)
+                    if r.ok:
+                        try:
+                            j = r.json()
+                            if isinstance(j, dict) and int(j.get("imported", 0)) > 0:
+                                imported += int(j.get("imported", 0))
+                            else:
+                                imported += 1
+                        except Exception:
+                            imported += 1
+                    else:
+                        QMessageBox.warning(self, "取込失敗", f"{Path(f).name}: {r.status_code}")
+            except Exception as e:
+                QMessageBox.warning(self, "取込失敗", f"{f}: {e}")
+            prog.setValue(i + 1)
+            try:
+                prog.setLabelText(Path(f).name)
+            except Exception:
+                pass
+            if prog.wasCanceled():
+                break
+        # リスト更新
+        self.refresh()
+        try:
+            win = self.window()
+            if hasattr(win, 'review_page'):
+                win.review_page.refresh()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            self.scan_status.setText(f"CSV/Excel取込 完了: {imported} 行")
         except Exception:
             pass
 
@@ -2637,7 +2699,7 @@ class ReviewPage(QWidget):
         self.table.setCellWidget(r1, 5, tcb)
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if getattr(self, "_loading", False):
+        if getattr(self, "_loading", False) or getattr(self, "_syncing_amount", False):
             return
         r = item.row()
         c = item.column()
@@ -2670,6 +2732,21 @@ class ReviewPage(QWidget):
                 csub.clear(); csub.addItems([""] + list(getattr(self, "_acct_subs", {}).get(credit, [])))
             if isinstance(sum_cb, QComboBox):
                 sum_cb.clear(); sum_cb.addItems([""] + list(getattr(self, "_acct_summaries", {}).get(debit, [])))
+            return
+        # Mirror amount: when debit amount edited (top row, col=2), copy to credit amount (col=4)
+        if r % 2 == 0 and c == 2:
+            try:
+                txt = item.text()
+                self._syncing_amount = True
+                if self.table.item(r, 4) is None:
+                    self.table.setItem(r, 4, QTableWidgetItem(txt))
+                else:
+                    self.table.item(r, 4).setText(txt)
+            except Exception:
+                pass
+            finally:
+                self._syncing_amount = False
+            return
 
     # PDF preview helpers
     def _show_pdf(self, path: Optional[str]) -> None:

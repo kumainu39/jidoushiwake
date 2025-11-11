@@ -252,6 +252,220 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
     return doc
 
 
+def _norm_date_str(s: str | None) -> str | None:
+    """Normalize various date strings to 'YYYY/MM/DD'. Returns None on failure.
+
+    Accepts common Japanese formats like 'YYYY-MM-DD', 'YYYY/MM/DD',
+    'YYYY年M月D日', 'YY/MM/DD', and compacts without leading zeros.
+    """
+    if not s:
+        return None
+    t = (s or "").strip()
+    if not t:
+        return None
+    import re as _re
+    try:
+        # 年月日形式
+        m = _re.match(r"^(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?$", t)
+        if m:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+        # 2桁年 -> 2000年代と仮定
+        m = _re.match(r"^(\d{2})[年/\-](\d{1,2})[月/\-](\d{1,2})日?$", t)
+        if m:
+            y, mo, d = 2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+        # 8桁 or 6桁(YYMMDD)
+        m = _re.match(r"^(\d{8})$", t)
+        if m:
+            y = int(t[0:4]); mo = int(t[4:6]); d = int(t[6:8])
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+        m = _re.match(r"^(\d{6})$", t)
+        if m:
+            y = 2000 + int(t[0:2]); mo = int(t[2:4]); d = int(t[4:6])
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+        # fallback: split by non-digits
+        parts = [p for p in _re.split(r"\D+", t) if p]
+        if len(parts) >= 3:
+            y = int(parts[0]); mo = int(parts[1]); d = int(parts[2])
+            if y < 100:
+                y += 2000
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+    except Exception:
+        return None
+    return None
+
+
+def _int_from_amount_like(v: object) -> int | None:
+    """Convert various amount-like values to int. Returns None if not parseable."""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, (int,)):
+            return int(v)
+        s = str(v).strip()
+        if not s:
+            return None
+        # remove currency and commas
+        import re as _re
+        s = _re.sub(r"[円,\s\\]", "", s)
+        # parentheses as negative
+        neg = s.startswith("(") and s.endswith(")")
+        s = s.strip("()")
+        if s in ("-", ""):
+            return None
+        x = int(float(s))
+        return -x if neg else x
+    except Exception:
+        return None
+
+
+def import_transactions_table(
+    session: Session,
+    company_id: int,
+    rows: list[dict[str, object]],
+    source_path: Path,
+) -> int:
+    """Import bank/card transaction rows as Documents + AutoResults.
+
+    This creates one Document per row, stores a synthesized text in `ocr_text`
+    for downstream rule matching, and fills AutoResult fields from columns.
+    """
+    # Preload rules/mappings once
+    from sqlalchemy import select as _select
+    gr_list: list[GlobalRule] = []
+    try:
+        for gr in session.scalars(
+            _select(GlobalRule).where(GlobalRule.enabled == 1).order_by(GlobalRule.priority.desc(), GlobalRule.id.asc())
+        ):
+            gr_list.append(gr)
+    except Exception:
+        gr_list = []
+    km_list: list[KeywordMapping] = list(session.scalars(_select(KeywordMapping).where(KeywordMapping.company_id == company_id)))
+
+    def _get_first(row: dict[str, object], keys: list[str]) -> str | None:
+        for k in keys:
+            for kk in (k, k.lower(), k.upper()):
+                if kk in row and row[kk] is not None:
+                    s = str(row[kk]).strip()
+                    if s:
+                        return s
+        return None
+
+    imported = 0
+    for idx, row in enumerate(rows):
+        # Normalize keys: keep original and lower
+        norm_row: dict[str, object] = {}
+        for k, v in list(row.items()):
+            norm_row[k] = v
+            if isinstance(k, str):
+                lk = k.strip().lower()
+                if lk and lk not in norm_row:
+                    norm_row[lk] = v
+
+        date_raw = _get_first(
+            norm_row,
+            [
+                "日付",
+                "取引日",
+                "年月日",
+                "date",
+                "transaction date",
+                "value date",
+                "取引年月日",
+            ],
+        )
+        date = _norm_date_str(date_raw) if date_raw else None
+
+        # Amount: prefer single '金額/amount'; else compute deposit - withdrawal
+        amount = None
+        amount = _int_from_amount_like(
+            _get_first(norm_row, ["金額", "amount", "ご利用金額", "利用金額", "出金額", "支出", "withdrawal"])
+        )
+        if amount is None:
+            dep = _int_from_amount_like(_get_first(norm_row, ["入金額", "収入", "deposit"])) or 0
+            wdr = _int_from_amount_like(_get_first(norm_row, ["出金額", "支出", "withdrawal"])) or 0
+            amount = dep - wdr if (dep or wdr) else None
+
+        summary = _get_first(
+            norm_row,
+            ["摘要", "内容", "メモ", "備考", "詳細", "説明", "description", "明細", "用途", "品目", "subject"],
+        ) or ""
+        counterparty = _get_first(
+            norm_row, ["相手先", "支払先", "振込先", "取引先", "payee", "相手方", "店名", "merchant", "名称"]
+        ) or ""
+        debit = _get_first(norm_row, ["借方科目", "借方勘定科目", "debit", "debit_account"]) or ""
+        credit = _get_first(norm_row, ["貸方科目", "貸方勘定科目", "credit", "credit_account"]) or ""
+
+        # Build text blob for rule matching
+        try:
+            values_str = " ".join([str(v) for v in row.values() if v is not None])
+        except Exception:
+            values_str = summary or counterparty
+        text_combined = f"{summary} {counterparty} {values_str}".strip()
+        text_lower = (text_combined or "").lower()
+
+        # Apply rules if accounts missing
+        applied_score = 0
+        if not (debit and credit):
+            for gr in gr_list:
+                try:
+                    if gr.keyword and (gr.keyword.lower() in text_lower):
+                        debit = debit or gr.debit_account
+                        credit = credit or gr.credit_account
+                        break
+                except Exception:
+                    continue
+        for km in km_list:
+            try:
+                if km.keyword and (km.keyword.lower() in text_lower):
+                    if km.debit_account:
+                        debit = km.debit_account
+                    if km.credit_account:
+                        credit = km.credit_account
+                    applied_score += km.weight
+            except Exception:
+                continue
+
+        # Invoice/tax hints from text
+        import re as _re
+        inv_status = None
+        if _re.search(r"T\d{13}", text_combined or ""):
+            inv_status = "適格"
+        else:
+            if _re.search(r"(領収書|請求書|領収|請求)", text_combined or ""):
+                inv_status = "非適格"
+        t_lower = text_lower
+        if any(k in t_lower for k in ("非課税", "不課税", "対象外")):
+            inv_status = "非課税"
+        elif any(k in t_lower for k in ("軽減", "8%", "８％", "8％")):
+            inv_status = "軽減8%"
+        elif any(k in t_lower for k in ("10%", "１０％", "10％")):
+            inv_status = inv_status or "課税10%"
+
+        # Persist
+        doc_name = f"{source_path.name}#row{idx+1}"
+        doc = Document(company_id=company_id, file_path=str(source_path.with_name(doc_name)), ocr_text=text_combined)
+        session.add(doc)
+        session.flush()
+
+        auto = AutoResult(
+            document_id=doc.id,
+            date=date,
+            amount=amount or 0,
+            summary=summary,
+            debit_account=debit,
+            credit_account=credit,
+            counterparty=counterparty,
+            score=applied_score,
+            invoice_status=inv_status,
+        )
+        session.add(auto)
+        imported += 1
+
+    return imported
+
+
 def _run_llm_refine_paginated(session: Session, company_id: int, texts: dict) -> Optional[dict]:
     """Run LLM refinement page-by-page to avoid prompt size limits and combine results.
 

@@ -34,6 +34,7 @@ from ..services import (
     import_accounts_from_text,
     import_account_master_from_text,
     list_account_master,
+    import_transactions_table,
 )
 from ..ocr_master import OCRMasterSample, OCRMasterSettings
 from ..llm_client import LLMConfig, set_config as set_llm_config
@@ -61,6 +62,10 @@ class DocumentOut(BaseModel):
     file_path: str
     status: str
     auto: Optional[dict]
+
+
+class ImportTransactionsOut(BaseModel):
+    imported: int
 
 
 @app.on_event("startup")
@@ -156,6 +161,78 @@ def api_list_documents(company_name: str, status: Optional[str] = None):
                 )
             )
         return items
+
+
+@app.post("/transactions/import", response_model=ImportTransactionsOut)
+async def api_import_transactions(company_name: str = Form(...), file: UploadFile = File(...)):
+    contents = await file.read()
+    uploads_dir = Path("data") / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    original = uploads_dir / file.filename
+    original.write_bytes(contents)
+
+    # Parse into list of dict rows
+    rows: list[dict[str, object]] = []
+    name_lower = (file.filename or "").lower()
+    try:
+        if name_lower.endswith(".csv") or name_lower.endswith(".tsv"):
+            import io, csv
+            # Try UTF-8 BOM then CP932
+            text: str
+            try:
+                text = contents.decode("utf-8-sig")
+            except Exception:
+                try:
+                    text = contents.decode("cp932")
+                except Exception:
+                    text = contents.decode(errors="ignore")
+            delim = ","
+            if name_lower.endswith(".tsv"):
+                delim = "\t"
+            reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+            for r in reader:
+                # Keep as dict[str, object]
+                rows.append({k: v for k, v in (r or {}).items()})
+        elif name_lower.endswith(".xlsx") or name_lower.endswith(".xls"):
+            try:
+                import openpyxl  # type: ignore
+            except Exception:
+                raise HTTPException(status_code=400, detail="Excelの読み込みに必要なopenpyxlがインストールされていません")
+            if name_lower.endswith(".xls"):
+                raise HTTPException(status_code=400, detail="Excel(xls)は未対応です。xlsxをご利用ください")
+            wb = openpyxl.load_workbook(original, data_only=True)
+            ws = wb.active
+            # Find header row (first non-empty row)
+            header: list[str] = []
+            start_row = 1
+            for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                vals = [str(v).strip() if v is not None else "" for v in row]
+                if any(vals):
+                    header = [v if v else f"COL{idx+1}" for idx, v in enumerate(vals)]
+                    start_row = i + 1
+                    break
+            if not header:
+                raise HTTPException(status_code=400, detail="Excelにヘッダー行が見つかりません")
+            # Read subsequent rows
+            for j, row in enumerate(ws.iter_rows(min_row=start_row, values_only=True), start=start_row):
+                vals = list(row)
+                if not any(v is not None and str(v).strip() for v in vals):
+                    continue
+                rec: dict[str, object] = {}
+                for idx, h in enumerate(header):
+                    rec[str(h)] = vals[idx] if idx < len(vals) else None
+                rows.append(rec)
+        else:
+            raise HTTPException(status_code=400, detail="CSV/TSV/XLSXのみ対応しています")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"ファイル解析に失敗しました: {e}")
+
+    with get_session() as s:
+        company = ensure_company(s, company_name)
+        n = import_transactions_table(s, company.id, rows, original)
+        return ImportTransactionsOut(imported=n)
 
 
 class ConfirmIn(BaseModel):

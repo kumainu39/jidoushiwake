@@ -214,7 +214,7 @@ def _guess_accounts(text: str) -> Tuple[str, str]:
             credit = acc
             break
     else:
-        credit = "未払金"
+        credit = "現金"
 
     return debit, credit
 
