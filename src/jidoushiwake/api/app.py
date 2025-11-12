@@ -11,6 +11,7 @@ from ..db import get_session
 from ..models import Company, DocumentStatusEnum
 from ..services import (
     confirm_document,
+    confirm_document_multi,
     delete_document,
     import_pdf,
     init_db,
@@ -19,6 +20,8 @@ from ..services import (
     mark_check_later,
     ensure_company,
     export_confirmed_csv,
+    get_company_settings,
+    update_company_settings,
     get_company_settings,
     update_company_settings,
     get_account_settings,
@@ -261,6 +264,45 @@ def api_ok_document(document_id: int, payload: ConfirmIn):
             credit_sub=payload.credit_subaccount,
             invoice_status=payload.invoice_status,
         )
+        # Ensure the status change is visible to immediate subsequent GETs
+        try:
+            s.commit()
+        except Exception:
+            pass
+        return {"status": "ok", "csv": str(out_path)}
+
+
+class ConfirmMultiRow(BaseModel):
+    date: Optional[str] = None
+    amount: Optional[int] = None
+    summary: Optional[str] = None
+    debit_account: Optional[str] = None
+    credit_account: Optional[str] = None
+
+
+class ConfirmMultiIn(BaseModel):
+    entries: list[ConfirmMultiRow]
+
+
+@app.post("/documents/{document_id}/ok_multi")
+def api_ok_document_multi(document_id: int, payload: ConfirmMultiIn):
+    with get_session() as s:
+        rows = []
+        for it in payload.entries or []:
+            rows.append(
+                {
+                    "date": it.date,
+                    "amount": it.amount,
+                    "summary": it.summary,
+                    "debit_account": it.debit_account,
+                    "credit_account": it.credit_account,
+                }
+            )
+        out_path = confirm_document_multi(s, document_id=document_id, rows=rows)
+        try:
+            s.commit()
+        except Exception:
+            pass
         return {"status": "ok", "csv": str(out_path)}
 
 
@@ -279,7 +321,7 @@ def api_delete_document(document_id: int):
 
 
 @app.post("/export")
-def api_export(company_name: str, encoding: str = "utf-8", bom: bool = False, target_dir: str | None = None):
+def api_export(company_name: str, encoding: str = "utf-8", bom: bool = True, target_dir: str | None = None):
     with get_session() as s:
         company = ensure_company(s, company_name)
         try:
@@ -293,6 +335,43 @@ def api_export(company_name: str, encoding: str = "utf-8", bom: bool = False, ta
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"status": "ok", "csv": str(out_path)}
+
+
+class RestoreOut(BaseModel):
+    restored: int
+
+
+@app.post("/export_restore", response_model=RestoreOut)
+def api_export_restore(csv_path: str):
+    # Given a CSV path, read adjacent .json manifest and set listed docs back to CONFIRMED
+    from pathlib import Path as _P
+    import json as _json
+    man = _P(csv_path)
+    if man.suffix.lower() == ".csv":
+        man = man.with_suffix("").with_name(man.stem).with_suffix(".json")
+    if not man.exists():
+        raise HTTPException(status_code=400, detail=f"Manifest not found: {man}")
+    try:
+        data = _json.loads(man.read_text(encoding="utf-8"))
+        ids = list(data.get("document_ids") or [])
+    except Exception:
+        ids = []
+    if not ids:
+        return RestoreOut(restored=0)
+    from ..models import Document, DocumentStatusEnum as _St
+    from ..db import get_session as _gs
+    restored = 0
+    with _gs() as s:
+        for did in ids:
+            try:
+                d = s.get(Document, int(did))
+                if d:
+                    d.status = _St.CONFIRMED.value
+                    s.add(d)
+                    restored += 1
+            except Exception:
+                continue
+    return RestoreOut(restored=restored)
 
 
 class CompanySettingsOut(BaseModel):

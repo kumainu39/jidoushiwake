@@ -46,6 +46,7 @@ def main() -> None:
             ins += 1
     conn.commit()
     print(f'Imported to account_master: {ins} (skipped {debug_miss})')
+    print('完了しました')
 
 
 if __name__ == '__main__':

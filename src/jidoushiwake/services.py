@@ -15,6 +15,7 @@ from .config import get_settings
 from .db import get_session, engine, Base
 from .models import (
     AutoResult,
+    AutoResultLine,
     Company,
     Correction,
     CorrectionActionEnum,
@@ -686,7 +687,8 @@ def _build_entries_for_document(doc: Document) -> list[JournalEntry]:
 
     parts = _extract_tax_breakdown(doc.ocr_text or "")
     if parts:
-        for p in parts:
+        total = len(parts)
+        for idx, p in enumerate(parts):
             try:
                 rate = int(p.get("rate") or 0)
             except Exception:
@@ -701,37 +703,63 @@ def _build_entries_for_document(doc: Document) -> list[JournalEntry]:
                 net = max(int(gross) - int(tax or 0), 0)
             amount_base = abs(int(net))
             tax_amt = abs(int(tax or 0))
+            # 識別フラグ: 複数行のときは 2110/2100/2101 を付与
+            if total <= 1:
+                ident = "2111"
+            elif idx == 0:
+                ident = "2110"
+            elif idx == total - 1:
+                ident = "2101"
+            else:
+                ident = "2100"
             entry = JournalEntry(
-                identifier_flag="****",
-                voucher_number="1",
+                identifier_flag=ident,
+                voucher_number="",
                 transaction_date=ar.date or _dt.now().strftime("%Y/%m/%d"),
                 debit=AccountSide(
                     account=ar.debit_account or "",
                     amount=amount_base,
-                    tax_category=_tax_cat(rate) if rate in (8, 10) else "",
+                    # 税区分(H) 必須: 請求書区分が「適格」なら内税表記
+                    tax_category=(
+                        ("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%")
+                        if rate in (8, 10)
+                        else ("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%")
+                    ),
                     tax_amount=tax_amt,
                 ),
                 credit=AccountSide(
                     account=ar.credit_account or "",
                     amount=amount_base,
+                    tax_category=(("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%") if rate in (8, 10) else ("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%")),
+                    tax_amount=0,
                 ),
                 summary=(ar.summary or "")[:64],
-                reference_number=str(Path(doc.file_path).stem)[:10],
-                memo=str(Path(doc.file_path).name)[:180],
+                reference_number="",
+                memo="",
             )
             entries.append(entry)
 
     if not entries:
         # Fallback: single-line entry without tax fields
         entry = JournalEntry(
-            identifier_flag="****",
-            voucher_number="1",
+            identifier_flag="2111",
+            voucher_number="",
             transaction_date=ar.date or _dt.now().strftime("%Y/%m/%d"),
-            debit=AccountSide(account=ar.debit_account or "", amount=abs(ar.amount or 0)),
-            credit=AccountSide(account=ar.credit_account or "", amount=abs(ar.amount or 0)),
+            debit=AccountSide(
+                account=ar.debit_account or "",
+                amount=abs(ar.amount or 0),
+                tax_category=("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%"),
+                tax_amount=0,
+            ),
+            credit=AccountSide(
+                account=ar.credit_account or "",
+                amount=abs(ar.amount or 0),
+                tax_category=("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%"),
+                tax_amount=0,
+            ),
             summary=(ar.summary or "")[:64],
-            reference_number=str(Path(doc.file_path).stem)[:10],
-            memo=str(Path(doc.file_path).name)[:180],
+            reference_number="",
+            memo="",
         )
         entries.append(entry)
 
@@ -754,6 +782,19 @@ def confirm_document(
         raise ValueError("Document not found")
 
     # Apply corrections to auto result
+    # Be defensive about legacy SQLite schemas that might miss newer columns
+    def _table_has(col: str) -> bool:
+        try:
+            bind = session.get_bind()
+            name = getattr(bind.dialect, "name", "") if bind is not None else ""
+            if name == "sqlite":
+                rows = bind.exec_driver_sql("PRAGMA table_info('auto_results')").all()  # type: ignore[attr-defined]
+                cols = {r[1] for r in rows}
+                return col in cols
+        except Exception:
+            pass
+        # For non-SQLite or on failure, assume column exists (modern schema)
+        return True
     if date is not None:
         doc.auto_result.date = date
     if amount is not None:
@@ -764,11 +805,11 @@ def confirm_document(
         doc.auto_result.debit_account = debit
     if credit is not None:
         doc.auto_result.credit_account = credit
-    if debit_sub is not None:
+    if debit_sub is not None and _table_has("debit_subaccount"):
         doc.auto_result.debit_subaccount = debit_sub or None
-    if credit_sub is not None:
+    if credit_sub is not None and _table_has("credit_subaccount"):
         doc.auto_result.credit_subaccount = credit_sub or None
-    if invoice_status is not None:
+    if invoice_status is not None and _table_has("invoice_status"):
         doc.auto_result.invoice_status = invoice_status or None
 
     doc.status = DocumentStatusEnum.CONFIRMED.value
@@ -830,7 +871,7 @@ def confirm_document(
 
     entries = _build_entries_for_document(doc)
     exporter = JournalExporter(entries=entries)
-    exporter.save(out_path, encoding="utf-8")
+    exporter.save(out_path, encoding="utf-8", bom=True)
 
     # Duplicate and archive stamped PDF copies
     try:
@@ -838,6 +879,155 @@ def confirm_document(
     except Exception:
         # Non-fatal: continue even if archiving fails
         pass
+    return out_path
+
+
+def confirm_document_multi(
+    session: Session,
+    document_id: int,
+    rows: list[dict[str, object]],
+) -> Path:
+    """Confirm a document with multiple journal rows and export a multi-line Yayoi CSV.
+
+    - Updates the document's AutoResult from the first row (for consistency with lists and logs).
+    - Marks the document as CONFIRMED.
+    - Exports all provided rows as individual lines in one CSV.
+    """
+    doc = session.get(Document, document_id)
+    if not doc or not doc.auto_result:
+        raise ValueError("Document not found")
+    if not rows:
+        raise ValueError("No rows provided")
+
+    first = rows[0]
+
+    def _get(d: dict[str, object], k: str) -> str | None:
+        v = d.get(k)
+        return str(v).strip() if isinstance(v, str) else (str(v).strip() if v is not None else None)
+
+    # Update auto_result from the first row
+    try:
+        if first.get("date") is not None:
+            doc.auto_result.date = _get(first, "date")
+        if first.get("amount") is not None:
+            try:
+                doc.auto_result.amount = int(first.get("amount") or 0)
+            except Exception:
+                pass
+        if first.get("summary") is not None:
+            doc.auto_result.summary = _get(first, "summary") or ""
+        if first.get("debit_account") is not None:
+            doc.auto_result.debit_account = _get(first, "debit_account") or ""
+        if first.get("credit_account") is not None:
+            doc.auto_result.credit_account = _get(first, "credit_account") or ""
+    except Exception:
+        pass
+
+    doc.status = DocumentStatusEnum.CONFIRMED.value
+    session.add(doc)
+
+    # Replace existing lines for this document
+    try:
+        from sqlalchemy import delete as _delete
+        session.execute(_delete(AutoResultLine).where(AutoResultLine.document_id == doc.id))
+    except Exception:
+        pass
+
+    # Build entries from rows
+    from datetime import datetime as _dt
+    try:
+        base_date = doc.auto_result.date or _dt.now().strftime("%Y/%m/%d")
+    except Exception:
+        base_date = _dt.now().strftime("%Y/%m/%d")
+
+    entries: list[JournalEntry] = []
+    total_rows = len(rows)
+    for i, r in enumerate(rows):
+        try:
+            dt = _get(r, "date") or base_date
+            debit = _get(r, "debit_account") or ""
+            credit = _get(r, "credit_account") or ""
+            try:
+                amt = abs(int(r.get("amount") or 0))
+            except Exception:
+                amt = abs(int(doc.auto_result.amount or 0))
+            summary = _get(r, "summary") or (doc.auto_result.summary or "")
+            # Persist line
+            try:
+                session.add(
+                    AutoResultLine(
+                        document_id=doc.id,
+                        line_no=i + 1,
+                        date=dt,
+                        amount=amt,
+                        summary=summary,
+                        debit_account=debit,
+                        credit_account=credit,
+                    )
+                )
+            except Exception:
+                pass
+            # 識別フラグ: 1行=2111、複数行は 2110/2100/2101
+            if total_rows <= 1:
+                ident = "2111"
+            elif i == 0:
+                ident = "2110"
+            elif i == total_rows - 1:
+                ident = "2101"
+            else:
+                ident = "2100"
+            entry = JournalEntry(
+                identifier_flag=ident,
+                voucher_number="",
+                transaction_date=dt,
+                debit=AccountSide(
+                    account=debit,
+                    amount=amt,
+                    tax_category=("課対仕入内10%適格" if getattr(doc.auto_result, "invoice_status", None) == "適格" else "課対仕入10%"),
+                    tax_amount=0,
+                ),
+                credit=AccountSide(account=credit, amount=amt),
+                summary=summary[:64],
+                reference_number="",
+                memo="",
+            )
+            entries.append(entry)
+        except Exception:
+            continue
+
+    if not entries:
+        raise ValueError("No valid rows to export")
+
+    # Save multi-line CSV
+    settings = get_settings()
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = settings.output_dir / f"{ts}_yayoi.csv"
+    exporter = JournalExporter(entries=entries)
+    exporter.save(out_path, encoding="utf-8", bom=True)
+
+    # Archive stamped PDF copies (best-effort)
+    try:
+        _archive_stamped_pdf(session, doc)
+    except Exception:
+        pass
+
+    # Record a single correction entry (multi)
+    try:
+        session.add(
+            Correction(
+                document_id=doc.id,
+                action=CorrectionActionEnum.OK.value,
+                corrected_date=doc.auto_result.date,
+                corrected_amount=doc.auto_result.amount,
+                corrected_summary=doc.auto_result.summary,
+                debit_account=doc.auto_result.debit_account,
+                credit_account=doc.auto_result.credit_account,
+            )
+        )
+    except Exception:
+        pass
+
     return out_path
 
 
@@ -865,10 +1055,55 @@ def export_confirmed_csv(
         raise ValueError("No confirmed documents to export")
 
     entries: list[JournalEntry] = []
+    included_ids: list[int] = []
+    from sqlalchemy import select as _select
     for d in docs:
         if not d.auto_result:
             continue
-        entries.extend(_build_entries_for_document(d))
+        # If multi-line entries exist for this document, use them; otherwise fallback
+        try:
+            lines = list(session.scalars(_select(AutoResultLine).where(AutoResultLine.document_id == d.id)))
+        except Exception:
+            lines = []
+        if lines:
+            from datetime import datetime as _dt
+            total = len(lines)
+            for i, ln in enumerate(lines):
+                try:
+                    dt = ln.date or (d.auto_result.date or _dt.now().strftime("%Y/%m/%d"))
+                    amt = abs(int(ln.amount or 0))
+                except Exception:
+                    dt = d.auto_result.date or _dt.now().strftime("%Y/%m/%d")
+                    amt = abs(int(d.auto_result.amount or 0))
+                if total <= 1:
+                    ident = "2111"
+                elif i == 0:
+                    ident = "2110"
+                elif i == total - 1:
+                    ident = "2101"
+                else:
+                    ident = "2100"
+                entries.append(
+                    JournalEntry(
+                        identifier_flag=ident,
+                        voucher_number="",
+                        transaction_date=dt,
+                        debit=AccountSide(
+                            account=(ln.debit_account or d.auto_result.debit_account or ""),
+                            amount=amt,
+                            tax_category=("課対仕入内10%適格" if getattr(d.auto_result, "invoice_status", None) == "適格" else "課対仕入10%"),
+                            tax_amount=0,
+                        ),
+                        credit=AccountSide(account=(ln.credit_account or d.auto_result.credit_account or ""), amount=amt),
+                        summary=((ln.summary or d.auto_result.summary or "")[:64]),
+                        reference_number="",
+                        memo="",
+                    )
+                )
+            included_ids.append(int(d.id))
+        else:
+            entries.extend(_build_entries_for_document(d))
+            included_ids.append(int(d.id))
 
     settings = get_settings()
     target_dir = output_dir or settings.output_dir
@@ -877,6 +1112,32 @@ def export_confirmed_csv(
     out_path = target_dir / f"{ts}_yayoi.csv"
     exporter = JournalExporter(entries=entries)
     exporter.save(out_path, encoding=encoding, bom=bom)
+
+    # Write manifest for this export (to enable later restore)
+    try:
+        import json as _json
+        manifest = {
+            "csv": str(out_path),
+            "exported_at": datetime.now().isoformat(),
+            "company_id": int(company_id),
+            "document_ids": included_ids,
+        }
+        man_path = out_path.with_suffix("").with_name(out_path.stem).with_suffix(".json")
+        # If stem has .csv, replace with .json; above ensures .json alongside
+        with open(man_path, "w", encoding="utf-8") as fh:
+            _json.dump(manifest, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    # Mark exported docs as EXPORTED
+    try:
+        idset = set(included_ids)
+        for d in docs:
+            if int(d.id) in idset:
+                d.status = DocumentStatusEnum.EXPORTED.value
+                session.add(d)
+    except Exception:
+        pass
     return out_path
 
 

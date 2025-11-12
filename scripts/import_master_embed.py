@@ -251,6 +251,7 @@ def main() -> None:
             ins += 1
     conn.commit()
     print(f'Imported master accounts: {ins}')
+    print('完了しました')
 
 
 if __name__ == '__main__':

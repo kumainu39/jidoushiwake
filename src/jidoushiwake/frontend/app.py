@@ -1757,19 +1757,30 @@ class OutputPage(QWidget):
 
         self.info = QLabel()
         export_btn = QPushButton("弥生インポート形式で出力")
-        export_btn.clicked.connect(self.on_export)  # type: ignore[arg-type]
+        export_btn.clicked.connect(self.on_export2)  # type: ignore[arg-type]
 
         # Past exports list
         self.list_widget = QListWidget()
         refresh_btn = QPushButton("履歴を更新")
         refresh_btn.clicked.connect(self.refresh_history)  # type: ignore[arg-type]
+        open_btn = QPushButton("選択CSVを開く")
+        restore_btn = QPushButton("選択CSVの仕訳を確認済みに戻す")
+        try:
+            open_btn.clicked.connect(self.open_selected_csv)  # type: ignore[arg-type]
+            restore_btn.clicked.connect(self.restore_selected)  # type: ignore[arg-type]
+        except Exception:
+            pass
 
         layout.addLayout(dest_row)
         layout.addWidget(self.info)
         layout.addWidget(export_btn)
         layout.addWidget(QLabel("過去の出力"))
         layout.addWidget(self.list_widget)
-        layout.addWidget(refresh_btn)
+        row_hist = QHBoxLayout()
+        row_hist.addWidget(refresh_btn)
+        row_hist.addWidget(open_btn)
+        row_hist.addWidget(restore_btn)
+        layout.addLayout(row_hist)
         layout.addStretch(1)
         self.setLayout(layout)
         self.update_info()
@@ -1812,6 +1823,26 @@ class OutputPage(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "保存失敗", str(e))
 
+    # New: clearer message when exporting confirmed journals
+    def on_export2(self) -> None:
+        dest = self.dest_edit.text().strip()
+        params = {"company_name": self.company}
+        if dest:
+            params["target_dir"] = dest
+        try:
+            # Ask server to produce UTF-8 with BOM for Excel compatibility
+            params["encoding"] = "utf-8"
+            params["bom"] = True
+            r = requests.post(f"{API_URL}/export", params=params, timeout=60)
+            if r.ok:
+                path = r.json().get("csv")
+                QMessageBox.information(self, "出力完了", f"確認済み仕訳を弥生インポート形式で出力しました。\n{path}")
+                self.refresh_history()
+            else:
+                QMessageBox.warning(self, "出力失敗", r.text)
+        except Exception as e:
+            QMessageBox.warning(self, "出力失敗", str(e))
+
     def choose_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "出力先フォルダ選択", self.dest_edit.text() or str(Path.home()))
         if d:
@@ -1832,6 +1863,32 @@ class OutputPage(QWidget):
                 self.list_widget.addItem(str(f))
         except Exception:
             pass
+
+    def open_selected_csv(self) -> None:
+        try:
+            it = self.list_widget.currentItem()
+            if not it:
+                return
+            import webbrowser
+            p = Path(it.text()).resolve()
+            webbrowser.open(str(p))
+        except Exception:
+            pass
+
+    def restore_selected(self) -> None:
+        it = self.list_widget.currentItem()
+        if not it:
+            return
+        csv_path = it.text().strip()
+        try:
+            r = requests.post(f"{API_URL}/export_restore", params={"csv_path": csv_path}, timeout=30)
+            if r.ok:
+                n = (r.json() or {}).get("restored")
+                QMessageBox.information(self, "復元完了", f"{n} 件を確認済みに戻しました")
+            else:
+                QMessageBox.warning(self, "復元失敗", r.text)
+        except Exception as e:
+            QMessageBox.warning(self, "復元失敗", str(e))
 
 
 class ScanPage(QWidget):
@@ -2322,7 +2379,7 @@ class ReviewPage(QWidget):
         self.btn_save = QPushButton("保存/OK（学習）")
         self.btn_later = QPushButton("後で確認")
         self.btn_delete = QPushButton("削除")
-        self.btn_save.clicked.connect(self._save_selected)  # type: ignore[arg-type]
+        self.btn_save.clicked.connect(self._save_selected2)  # type: ignore[arg-type]
         self.btn_later.clicked.connect(self._mark_later)  # type: ignore[arg-type]
         self.btn_delete.clicked.connect(self._delete_selected)  # type: ignore[arg-type]
         btn_row.addWidget(self.btn_save)
@@ -2364,6 +2421,21 @@ class ReviewPage(QWidget):
         right = QVBoxLayout()
         right.addLayout(btn_row)
         right.addLayout(util_row)
+
+        # Row controls for multi-line support
+        row_ctrl = QHBoxLayout()
+        self.btn_add_pair = QPushButton("行追加")
+        self.btn_del_pair = QPushButton("選択行削除")
+        try:
+            self.btn_add_pair.clicked.connect(self._add_pair)  # type: ignore[arg-type]
+            self.btn_del_pair.clicked.connect(self._delete_pair)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        row_ctrl.addStretch(1)
+        row_ctrl.addWidget(self.btn_add_pair)
+        row_ctrl.addWidget(self.btn_del_pair)
+
+        right.addLayout(row_ctrl)
         right.addWidget(self.table)
         right_wrap = QWidget(); right_wrap.setLayout(right)
 
@@ -2814,6 +2886,74 @@ class ReviewPage(QWidget):
             return
 
     # PDF preview helpers
+    def _add_pair(self) -> None:
+        try:
+            n = self.table.rowCount()
+        except Exception:
+            n = 0
+        # Append two rows for a new entry
+        new_r0 = n
+        new_r1 = n + 1
+        try:
+            self.table.setRowCount(n + 2)
+        except Exception:
+            return
+        # Map both rows to current doc id
+        try:
+            doc_id = int((getattr(self, "_row_to_id", [0]) or [0])[0])
+        except Exception:
+            doc_id = None
+        try:
+            if not hasattr(self, "_row_to_id"):
+                self._row_to_id = []
+            self._row_to_id.extend([doc_id, doc_id])
+        except Exception:
+            pass
+        # Initialize cells with blanks and widgets
+        try:
+            # default date to first row's date if any
+            date_txt = ""
+            if new_r0 >= 2 and self.table.item(0, 0):
+                date_txt = self.table.item(0, 0).text().strip()
+            for j in (0, 1, 2, 3, 4, 5, 6):
+                if j in (5, 6):
+                    continue
+                val = date_txt if j == 0 else ""
+                self.table.setItem(new_r0, j, QTableWidgetItem(val))
+            for j in (0, 2, 4, 6):
+                self.table.setItem(new_r1, j, QTableWidgetItem(""))
+            # Setup widgets on new pair
+            self._setup_row_widgets(new_r0, new_r1, "", "", "", "", "", "")
+        except Exception:
+            pass
+
+    def _delete_pair(self) -> None:
+        try:
+            n = self.table.rowCount()
+        except Exception:
+            n = 0
+        if n <= 2:
+            return  # keep at least one pair
+        sel = self.table.selectedIndexes()
+        if sel:
+            r = sel[0].row()
+        else:
+            r = n - 2  # last pair
+        r0 = r - (r % 2)
+        r1 = r0 + 1
+        try:
+            # Remove bottom row first
+            self.table.removeRow(r1)
+            self.table.removeRow(r0)
+            try:
+                # Remove mapping entries
+                if hasattr(self, "_row_to_id"):
+                    del self._row_to_id[r0:r0+2]
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _show_pdf(self, path: Optional[str]) -> None:
         self._pdf_path = path or None
         self._pdf_page = getattr(self, '_pdf_page', 0)
@@ -3061,14 +3201,23 @@ class ReviewPage(QWidget):
     # Save/later/delete
     def _selected_doc_id_and_rows(self) -> tuple[Optional[int], Optional[int], Optional[int]]:
         sel = self.table.selectedIndexes()
-        if not sel:
-            return None, None, None
-        r = sel[0].row()
-        # Normalize to top row of pair
-        r0 = r - (r % 2)
-        r1 = r0 + 1
-        doc_id = self._row_to_id[r0]
-        return doc_id, r0, r1
+        if sel:
+            r = sel[0].row()
+            # Normalize to top row of pair
+            r0 = r - (r % 2)
+            r1 = r0 + 1
+            try:
+                doc_id = self._row_to_id[r0]
+            except Exception:
+                doc_id = None
+            return doc_id, r0, r1
+        # No selection: treat the currently displayed PDF's two rows as selected
+        try:
+            if self.table.rowCount() >= 2 and len(getattr(self, "_row_to_id", []) or []) >= 2:
+                return int(self._row_to_id[0]), 0, 1
+        except Exception:
+            pass
+        return None, None, None
 
     def _collect_from_table(self, r0: int, r1: int) -> dict:
         # Extract values from pair rows
@@ -3113,6 +3262,21 @@ class ReviewPage(QWidget):
             "invoice_status": invoice or (tax_text or None),
         }
 
+    def _collect_all_pairs(self) -> list[dict]:
+        """Collect all row pairs (0-1, 2-3, ...) into a list of payload dicts."""
+        out: list[dict] = []
+        try:
+            n = self.table.rowCount()
+        except Exception:
+            n = 0
+        for r0 in range(0, max(0, n - 1), 2):
+            r1 = r0 + 1
+            try:
+                out.append(self._collect_from_table(r0, r1))
+            except Exception:
+                continue
+        return out
+
     def _save_selected(self) -> None:
         doc_id, r0, r1 = self._selected_doc_id_and_rows()
         if doc_id is None or r0 is None or r1 is None:
@@ -3151,6 +3315,112 @@ class ReviewPage(QWidget):
                     win = self.window()
                     if hasattr(win, 'scan_page'):
                         win.scan_page.refresh()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            else:
+                QMessageBox.warning(self, "保存失敗", r.text)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失敗", str(e))
+
+    # New: clearer OK handling with proper messages and confirmed refresh
+    def _save_selected2(self) -> None:
+        doc_id, r0, r1 = self._selected_doc_id_and_rows()
+        if doc_id is None:
+            QMessageBox.information(self, "確認", "対象を選択してください")
+            return
+        # If more than one pair exists, send all pairs in one request
+        try:
+            row_cnt = self.table.rowCount()
+        except Exception:
+            row_cnt = 0
+        multi = row_cnt >= 4  # 2 pairs or more
+        if multi:
+            entries = []
+            for d in self._collect_all_pairs():
+                entries.append(
+                    {
+                        "date": d.get("date"),
+                        "amount": d.get("amount"),
+                        "summary": d.get("summary"),
+                        "debit_account": d.get("debit"),
+                        "credit_account": d.get("credit"),
+                    }
+                )
+            try:
+                r = requests.post(
+                    f"{API_URL}/documents/{doc_id}/ok_multi",
+                    json={"entries": entries},
+                    timeout=30,
+                )
+                if r.ok:
+                    path = None
+                    try:
+                        path = (r.json() or {}).get("csv")
+                    except Exception:
+                        path = None
+                    if path:
+                        QMessageBox.information(self, "確認", f"仕訳を確認済みに移動しました。\n複数行CSVを出力しました:\n{path}")
+                    else:
+                        QMessageBox.information(self, "確認", "仕訳を確認済みに移動しました。")
+                    self._load_unconfirmed()
+                    try:
+                        win = self.window()
+                        if hasattr(win, 'scan_page'):
+                            win.scan_page.refresh()  # type: ignore[attr-defined]
+                        if hasattr(win, 'confirmed_page'):
+                            win.confirmed_page.refresh()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                else:
+                    QMessageBox.warning(self, "保存失敗", r.text)
+            except Exception as e:
+                QMessageBox.warning(self, "保存失敗", str(e))
+            return
+
+        # Single pair: old behavior
+        data = self._collect_from_table(r0, r1)
+        try:
+            payload = {
+                "date": data["date"],
+                "amount": data["amount"],
+                "summary": data["summary"],
+                "debit": data["debit"],
+                "credit": data["credit"],
+                "debit_sub": data["debit_sub"],
+                "credit_sub": data["credit_sub"],
+                "invoice_status": data["invoice_status"],
+            }
+            r = requests.post(
+                f"{API_URL}/documents/{doc_id}/ok",
+                json={
+                    "date": payload.get("date"),
+                    "amount": payload.get("amount"),
+                    "summary": payload.get("summary"),
+                    "debit_account": payload.get("debit"),
+                    "credit_account": payload.get("credit"),
+                    "debit_subaccount": payload.get("debit_sub"),
+                    "credit_subaccount": payload.get("credit_sub"),
+                    "invoice_status": payload.get("invoice_status"),
+                },
+                timeout=20,
+            )
+            if r.ok:
+                path = None
+                try:
+                    path = (r.json() or {}).get("csv")
+                except Exception:
+                    path = None
+                if path:
+                    QMessageBox.information(self, "確認", f"仕訳を確認済みに移動しました。\n1行CSVを出力しました:\n{path}")
+                else:
+                    QMessageBox.information(self, "確認", "仕訳を確認済みに移動しました。")
+                self._load_unconfirmed()
+                try:
+                    win = self.window()
+                    if hasattr(win, 'scan_page'):
+                        win.scan_page.refresh()  # type: ignore[attr-defined]
+                    if hasattr(win, 'confirmed_page'):
+                        win.confirmed_page.refresh()  # type: ignore[attr-defined]
                 except Exception:
                     pass
             else:
@@ -3351,6 +3621,30 @@ class CheckPage(QWidget):
             pass
 
 
+class ConfirmedPage(QWidget):
+    def __init__(self, company: str) -> None:
+        super().__init__()
+        self.company = company
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("確認済み仕訳"))
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget)
+        refresh_btn = QPushButton("更新")
+        refresh_btn.clicked.connect(self.refresh)  # type: ignore[arg-type]
+        layout.addWidget(refresh_btn)
+        self.setLayout(layout)
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.list_widget.clear()
+        try:
+            resp = requests.get(f"{API_URL}/documents", params={"company_name": self.company, "status": "confirmed"}, timeout=10)
+            for item in resp.json():
+                self.list_widget.addItem(f"#{item['id']} - {Path(item['file_path']).name}")
+        except Exception:
+            pass
+
+
 class CompareDialog(QDialog):
     def __init__(self, company: str, new_doc: dict, old_doc: dict) -> None:
         super().__init__()
@@ -3451,12 +3745,14 @@ class MainWindow(QMainWindow):
         self.scan_page = ScanPage(company)
         self.review_page = ReviewPage(company)
         self.check_page = CheckPage(company)
+        self.confirmed_page = ConfirmedPage(company)
         self.output_page = OutputPage(company)
         self.dup_page = DuplicatesPage(company)
         self.settings_page = SettingsPage(company)
         self.stack.addWidget(self.scan_page)
         self.stack.addWidget(self.review_page)
         self.stack.addWidget(self.check_page)
+        self.stack.addWidget(self.confirmed_page)
         self.stack.addWidget(self.output_page)
         self.stack.addWidget(self.dup_page)
         self.stack.addWidget(self.settings_page)
@@ -3500,6 +3796,9 @@ class MainWindow(QMainWindow):
         act_export.triggered.connect(self.show_output)  # type: ignore[arg-type]
         act_dup.triggered.connect(self.show_dup)  # type: ignore[arg-type]
         act_settings.triggered.connect(self.show_settings)  # type: ignore[arg-type]
+        # Add Confirmed list menu
+        act_confirmed = menubar.addAction("確認済み仕訳")
+        act_confirmed.triggered.connect(self.show_confirmed)  # type: ignore[arg-type]
 
     def show_scan(self) -> None:
         self.stack.setCurrentIndex(0)
@@ -3530,8 +3829,23 @@ class MainWindow(QMainWindow):
 
     def show_output(self) -> None:
         # Update label to reflect any settings change
-        self.output_page.update_info()
-        self.stack.setCurrentIndex(3)
+        try:
+            self.output_page.update_info()
+        except Exception:
+            pass
+        # Navigate using indexOf to avoid mismatch when page order changes
+        idx = self.stack.indexOf(self.output_page)
+        if idx >= 0:
+            self.stack.setCurrentIndex(idx)
+
+    def show_confirmed(self) -> None:
+        try:
+            self.confirmed_page.refresh()
+        except Exception:
+            pass
+        idx = self.stack.indexOf(self.confirmed_page)
+        if idx >= 0:
+            self.stack.setCurrentIndex(idx)
 
     def show_settings(self) -> None:
         idx = self.stack.indexOf(self.settings_page)
@@ -3566,12 +3880,14 @@ class MainWindow(QMainWindow):
                     self.scan_page = ScanPage(self.company)
                     self.review_page = ReviewPage(self.company)
                     self.check_page = CheckPage(self.company)
+                    self.confirmed_page = ConfirmedPage(self.company)
                     self.output_page = OutputPage(self.company)
                     self.dup_page = DuplicatesPage(self.company)
                     self.settings_page = SettingsPage(self.company)
                     new_stack.addWidget(self.scan_page)
                     new_stack.addWidget(self.review_page)
                     new_stack.addWidget(self.check_page)
+                    new_stack.addWidget(self.confirmed_page)
                     new_stack.addWidget(self.output_page)
                     new_stack.addWidget(self.dup_page)
                     new_stack.addWidget(self.settings_page)
