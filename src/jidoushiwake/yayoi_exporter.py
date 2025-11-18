@@ -51,17 +51,17 @@ MAX_LENGTHS = {
 
 
 def _truncate(value: str, max_length: int) -> str:
-    """Truncate value to a maximum length, preserving half-width characters.
+    """Sanitize and truncate value to a maximum length.
 
-    Parameters
-    ----------
-    value:
-        Input string value (None will be treated as an empty string).
-    max_length:
-        Maximum number of characters (half-width) permitted by the Yayoi spec.
+    - Converts None to ''
+    - Replaces CR/LF with spaces to ensure 1-record-per-line CSV
+    - Truncates to the given half-width character limit
     """
 
     value = value or ""
+    # Remove embedded newlines and carriage returns which can break CSV row alignment
+    if "\n" in value or "\r" in value:
+        value = value.replace("\r", " ").replace("\n", " ")
     if len(value) <= max_length:
         return value
     LOGGER.debug("Truncating value '%s' to %d characters", value, max_length)

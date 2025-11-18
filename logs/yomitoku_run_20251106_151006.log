@@ -1,0 +1,30 @@
+[YOMITOKU] start: data\uploads\20250319_ミーツサンエー平野店.pdf
+[YOMITOKU] using Python package
+[YOMITOKU] CLI: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE
+[YOMITOKU] OutDir: data\uploads\yomitoku_output\20250319____________20251106_151006_8075
+[YOMITOKU] Cmd: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE data\uploads\20250319_ミーツサンエー平野店.pdf -f md --combine --encoding utf-8 -o data\uploads\yomitoku_output\20250319____________20251106_151006_8075
+[YOMITOKU] CLI returncode: 0
+
+----- CLI STDOUT -----
+
+
+----- CLI STDERR -----
+2025-11-06 15:10:13,390 - yomitoku.base - INFO - Initialize TextDetector
+2025-11-06 15:10:15,017 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:10:15,021 - yomitoku.base - INFO - Initialize TextRecognizer
+2025-11-06 15:10:16,282 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:10:16,282 - yomitoku.base - INFO - Initialize LayoutParser
+2025-11-06 15:10:17,196 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:10:17,209 - yomitoku.base - INFO - Initialize TableStructureRecognizer
+2025-11-06 15:10:18,173 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 15:10:18,198 - yomitoku.cli.main - INFO - Output directory: data\uploads\yomitoku_output\20250319____________20251106_151006_8075
+2025-11-06 15:10:18,198 - yomitoku.cli.main - INFO - Processing file: data\uploads\20250319_ミーツサンエー平野店.pdf
+2025-11-06 15:10:20,027 - yomitoku.base - INFO - LayoutParser __call__ elapsed_time: 1.7626368999481201
+2025-11-06 15:10:20,032 - yomitoku.base - INFO - TableStructureRecognizer __call__ elapsed_time: 0.0050089359283447266
+2025-11-06 15:10:21,603 - yomitoku.base - INFO - TextDetector __call__ elapsed_time: 3.3383097648620605
+2025-11-06 15:10:35,203 - yomitoku.base - INFO - TextRecognizer __call__ elapsed_time: 13.59978461265564
+2025-11-06 15:10:35,226 - yomitoku.cli.main - INFO - Total Processing time: 17.03 sec
+
+[YOMITOKU] collected: uploads_20250319_ミーツサンエー平野店.md (476 chars)
+[YOMITOKU] total collected text: 476 chars
+[YOMITOKU] done

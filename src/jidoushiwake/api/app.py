@@ -11,6 +11,7 @@ from ..db import get_session
 from ..models import Company, DocumentStatusEnum
 from ..services import (
     confirm_document,
+    confirm_document_multi,
     delete_document,
     import_pdf,
     init_db,
@@ -19,6 +20,8 @@ from ..services import (
     mark_check_later,
     ensure_company,
     export_confirmed_csv,
+    get_company_settings,
+    update_company_settings,
     get_company_settings,
     update_company_settings,
     get_account_settings,
@@ -34,6 +37,7 @@ from ..services import (
     import_accounts_from_text,
     import_account_master_from_text,
     list_account_master,
+    import_transactions_table,
 )
 from ..ocr_master import OCRMasterSample, OCRMasterSettings
 from ..llm_client import LLMConfig, set_config as set_llm_config
@@ -61,6 +65,10 @@ class DocumentOut(BaseModel):
     file_path: str
     status: str
     auto: Optional[dict]
+
+
+class ImportTransactionsOut(BaseModel):
+    imported: int
 
 
 @app.on_event("startup")
@@ -158,6 +166,78 @@ def api_list_documents(company_name: str, status: Optional[str] = None):
         return items
 
 
+@app.post("/transactions/import", response_model=ImportTransactionsOut)
+async def api_import_transactions(company_name: str = Form(...), file: UploadFile = File(...)):
+    contents = await file.read()
+    uploads_dir = Path("data") / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    original = uploads_dir / file.filename
+    original.write_bytes(contents)
+
+    # Parse into list of dict rows
+    rows: list[dict[str, object]] = []
+    name_lower = (file.filename or "").lower()
+    try:
+        if name_lower.endswith(".csv") or name_lower.endswith(".tsv"):
+            import io, csv
+            # Try UTF-8 BOM then CP932
+            text: str
+            try:
+                text = contents.decode("utf-8-sig")
+            except Exception:
+                try:
+                    text = contents.decode("cp932")
+                except Exception:
+                    text = contents.decode(errors="ignore")
+            delim = ","
+            if name_lower.endswith(".tsv"):
+                delim = "\t"
+            reader = csv.DictReader(io.StringIO(text), delimiter=delim)
+            for r in reader:
+                # Keep as dict[str, object]
+                rows.append({k: v for k, v in (r or {}).items()})
+        elif name_lower.endswith(".xlsx") or name_lower.endswith(".xls"):
+            try:
+                import openpyxl  # type: ignore
+            except Exception:
+                raise HTTPException(status_code=400, detail="Excelの読み込みに必要なopenpyxlがインストールされていません")
+            if name_lower.endswith(".xls"):
+                raise HTTPException(status_code=400, detail="Excel(xls)は未対応です。xlsxをご利用ください")
+            wb = openpyxl.load_workbook(original, data_only=True)
+            ws = wb.active
+            # Find header row (first non-empty row)
+            header: list[str] = []
+            start_row = 1
+            for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                vals = [str(v).strip() if v is not None else "" for v in row]
+                if any(vals):
+                    header = [v if v else f"COL{idx+1}" for idx, v in enumerate(vals)]
+                    start_row = i + 1
+                    break
+            if not header:
+                raise HTTPException(status_code=400, detail="Excelにヘッダー行が見つかりません")
+            # Read subsequent rows
+            for j, row in enumerate(ws.iter_rows(min_row=start_row, values_only=True), start=start_row):
+                vals = list(row)
+                if not any(v is not None and str(v).strip() for v in vals):
+                    continue
+                rec: dict[str, object] = {}
+                for idx, h in enumerate(header):
+                    rec[str(h)] = vals[idx] if idx < len(vals) else None
+                rows.append(rec)
+        else:
+            raise HTTPException(status_code=400, detail="CSV/TSV/XLSXのみ対応しています")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"ファイル解析に失敗しました: {e}")
+
+    with get_session() as s:
+        company = ensure_company(s, company_name)
+        n = import_transactions_table(s, company.id, rows, original)
+        return ImportTransactionsOut(imported=n)
+
+
 class ConfirmIn(BaseModel):
     date: Optional[str] = None
     amount: Optional[int] = None
@@ -184,6 +264,45 @@ def api_ok_document(document_id: int, payload: ConfirmIn):
             credit_sub=payload.credit_subaccount,
             invoice_status=payload.invoice_status,
         )
+        # Ensure the status change is visible to immediate subsequent GETs
+        try:
+            s.commit()
+        except Exception:
+            pass
+        return {"status": "ok", "csv": str(out_path)}
+
+
+class ConfirmMultiRow(BaseModel):
+    date: Optional[str] = None
+    amount: Optional[int] = None
+    summary: Optional[str] = None
+    debit_account: Optional[str] = None
+    credit_account: Optional[str] = None
+
+
+class ConfirmMultiIn(BaseModel):
+    entries: list[ConfirmMultiRow]
+
+
+@app.post("/documents/{document_id}/ok_multi")
+def api_ok_document_multi(document_id: int, payload: ConfirmMultiIn):
+    with get_session() as s:
+        rows = []
+        for it in payload.entries or []:
+            rows.append(
+                {
+                    "date": it.date,
+                    "amount": it.amount,
+                    "summary": it.summary,
+                    "debit_account": it.debit_account,
+                    "credit_account": it.credit_account,
+                }
+            )
+        out_path = confirm_document_multi(s, document_id=document_id, rows=rows)
+        try:
+            s.commit()
+        except Exception:
+            pass
         return {"status": "ok", "csv": str(out_path)}
 
 
@@ -202,7 +321,7 @@ def api_delete_document(document_id: int):
 
 
 @app.post("/export")
-def api_export(company_name: str, encoding: str = "utf-8", bom: bool = False, target_dir: str | None = None):
+def api_export(company_name: str, encoding: str = "utf-8", bom: bool = True, target_dir: str | None = None):
     with get_session() as s:
         company = ensure_company(s, company_name)
         try:
@@ -216,6 +335,43 @@ def api_export(company_name: str, encoding: str = "utf-8", bom: bool = False, ta
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"status": "ok", "csv": str(out_path)}
+
+
+class RestoreOut(BaseModel):
+    restored: int
+
+
+@app.post("/export_restore", response_model=RestoreOut)
+def api_export_restore(csv_path: str):
+    # Given a CSV path, read adjacent .json manifest and set listed docs back to CONFIRMED
+    from pathlib import Path as _P
+    import json as _json
+    man = _P(csv_path)
+    if man.suffix.lower() == ".csv":
+        man = man.with_suffix("").with_name(man.stem).with_suffix(".json")
+    if not man.exists():
+        raise HTTPException(status_code=400, detail=f"Manifest not found: {man}")
+    try:
+        data = _json.loads(man.read_text(encoding="utf-8"))
+        ids = list(data.get("document_ids") or [])
+    except Exception:
+        ids = []
+    if not ids:
+        return RestoreOut(restored=0)
+    from ..models import Document, DocumentStatusEnum as _St
+    from ..db import get_session as _gs
+    restored = 0
+    with _gs() as s:
+        for did in ids:
+            try:
+                d = s.get(Document, int(did))
+                if d:
+                    d.status = _St.CONFIRMED.value
+                    s.add(d)
+                    restored += 1
+            except Exception:
+                continue
+    return RestoreOut(restored=restored)
 
 
 class CompanySettingsOut(BaseModel):
@@ -567,6 +723,52 @@ def api_set_company_llm_settings(payload: CompanyLLMSettingsIn):
             use_colab=bool(getattr(cs, "use_colab", 0)),
             remote_base_url=getattr(cs, "remote_base_url", None),
         )
+
+
+# Admin: LLM connectivity ping (Colab/remote endpoint)
+class LLMPingIn(BaseModel):
+    url: Optional[str] = None
+    timeout: Optional[float] = None
+
+
+class LLMPingOut(BaseModel):
+    ok: bool
+    url: str
+    elapsed_ms: Optional[int] = None
+    detail: Optional[str] = None
+
+
+@app.post("/admin/llm_ping", response_model=LLMPingOut)
+def api_llm_ping(payload: LLMPingIn):
+    import time as _time
+    from ..llm_client import LLMConfig as _LLMConfig, temporary_config as _temp_cfg, available as _llm_available
+
+    base = (
+        payload.url
+        or _LLM_SETTINGS.remote_base_url
+        or _LLMConfig().remote_base_url
+        or "https://nonbeneficent-oversoftly-piper.ngrok-free.dev"
+    ).strip()
+    t0 = _time.perf_counter()
+    ok = False
+    detail = None
+    try:
+        cfg = _LLMConfig(
+            provider=_LLM_SETTINGS.provider,
+            model_path=_LLM_SETTINGS.model_path,
+            device="cpu",
+            n_gpu_layers=0,
+            n_threads=max(1, int(_LLM_SETTINGS.n_threads or 4)),
+            use_colab_remote=True,
+            remote_base_url=base,
+        )
+        with _temp_cfg(cfg):
+            ok = bool(_llm_available())
+    except Exception as e:
+        ok = False
+        detail = str(e)
+    elapsed = int(((_time.perf_counter() - t0) * 1000))
+    return LLMPingOut(ok=ok, url=base, elapsed_ms=elapsed, detail=detail)
 
 
 class CompanyLLMLogOut(BaseModel):

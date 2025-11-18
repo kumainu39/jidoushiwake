@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import sys
 from functools import partial
@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QAction, QBrush, QColor, QPixmap, QImage
+from PyQt6.QtGui import QAction, QBrush, QColor, QPixmap, QImage, QShortcut, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -57,7 +57,7 @@ def _load_ui_settings() -> dict:
         "pdf_label_min_width": 480,
         "pdf_label_max_width": 0,  # 0 = no limit
         "pdf_fixed_width": 420,
-        "pdf_scale_ratio": 1.25,
+        "pdf_scale_ratio": 1.0,
         "pdf_scale_ratio_min": 0.0,
         "pdf_scale_ratio_max": 2.0,
         "pdf_max_width_px": 0,  # 0 = auto
@@ -585,7 +585,12 @@ class AccountCellDelegate(QStyledItemDelegate):
             # attach completer to the lineEdit with [name, token]
             le = combo.lineEdit()
             if le is not None:
+                # Give QObject parents to keep them alive beyond this method
                 model = QStandardItemModel()
+                try:
+                    model.setParent(combo)
+                except Exception:
+                    pass
                 rev: dict[str, set[str]] = {n: set() for n in self._names}
                 for tok, nm in self._tok_map.items():
                     if nm in rev and tok:
@@ -597,7 +602,15 @@ class AccountCellDelegate(QStyledItemDelegate):
                             model.appendRow([QStandardItem(nm), QStandardItem(t)])
                     else:
                         model.appendRow([QStandardItem(nm), QStandardItem("")])
-                comp = QCompleter(model)
+                # Parent the completer to the editor to ensure proper lifetime
+                try:
+                    comp = QCompleter(model, le)
+                except Exception:
+                    comp = QCompleter(model)
+                try:
+                    comp.setParent(le)
+                except Exception:
+                    pass
                 comp.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
                 try:
                     comp.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
@@ -616,7 +629,17 @@ class AccountCellDelegate(QStyledItemDelegate):
                     comp.popup().setItemDelegate(_AccountListDelegate(None, comp.popup()))
                 except Exception:
                     pass
-                le.setCompleter(comp)
+                try:
+                    le.setCompleter(comp)
+                except RuntimeError:
+                    # If editor got destroyed prematurely, avoid bubbling up
+                    return combo
+                # Keep strong references to avoid GC collecting model/completer
+                try:
+                    setattr(le, "_jidou_completer", comp)
+                    setattr(le, "_jidou_completer_model", model)
+                except Exception:
+                    pass
                 # on choose, set JP name to combo
                 def _on_idx(idx):
                     try:
@@ -1058,6 +1081,124 @@ class _AccountDelegate(QStyledItemDelegate):
         super().setModelData(editor, model, index)
 
 
+class DateCellDelegate(QStyledItemDelegate):
+    """Date editor for the grid's date column using QDateEdit with calendar popup.
+
+    Accepts text in common formats like 'YYYY/MM/DD', 'YYYY-MM-DD', 'YYYY.MM.DD',
+    and a shorthand 'MMDD' (e.g., '0930' -> current year/09/30). Saves as 'YYYY/MM/DD'.
+    """
+
+    def createEditor(self, parent, option, index):  # type: ignore[override]
+        try:
+            from PyQt6.QtCore import QDate
+        except Exception:
+            return super().createEditor(parent, option, index)
+        ed = QDateEdit(parent)
+        ed.setCalendarPopup(True)
+        ed.setDisplayFormat("yyyy/MM/dd")
+        try:
+            ed.setDate(QDate.currentDate())
+        except Exception:
+            pass
+
+        # Add a small ■ button into the calendar popup's navigation bar
+        try:
+            cal = ed.calendarWidget()
+            if cal is not None:
+                nav = cal.findChild(QWidget, "qt_calendar_navigationbar") or cal.findChild(QWidget, "qt_calendar_navbar")
+                if nav is not None:
+                    # Avoid duplicates
+                    existing = nav.findChild(QPushButton, "calendar_jump_today")
+                    if existing is None:
+                        btn = QPushButton("■", nav)
+                        btn.setObjectName("calendar_jump_today")
+                        btn.setToolTip("今日へ")
+                        btn.setFixedWidth(18)
+                        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                        if nav.layout() is None:
+                            lay = QHBoxLayout(nav)
+                            lay.setContentsMargins(2, 2, 2, 2)
+                            lay.setSpacing(4)
+                        lay = nav.layout()
+                        lay.addWidget(btn)
+
+                        def _jump_today():
+                            try:
+                                today = QDate.currentDate()
+                                cal.setSelectedDate(today)
+                                try:
+                                    ed.setDate(today)
+                                except Exception:
+                                    pass
+                                try:
+                                    cal.showToday()
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+
+                        btn.clicked.connect(_jump_today)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
+        return ed
+
+    def setEditorData(self, editor, index):  # type: ignore[override]
+        try:
+            from PyQt6.QtCore import QDate
+        except Exception:
+            return super().setEditorData(editor, index)
+        # Support both bare QDateEdit and our wrapped container
+        target = editor
+        if not isinstance(editor, QDateEdit):
+            try:
+                target = getattr(editor, "_date_edit", editor)
+            except Exception:
+                target = editor
+        if isinstance(target, QDateEdit):
+            txt = str(index.data() or "").strip()
+            dt = None
+            # Try YYYY sep MM sep DD
+            for sep in ("/", "-", "."):
+                parts = txt.split(sep)
+                if len(parts) == 3 and all(p.isdigit() for p in parts):
+                    y, m, d = [int(p) for p in parts]
+                    dt = QDate(y, m, d)
+                    break
+            # Shorthand MMDD
+            if dt is None and len(txt) == 4 and txt.isdigit():
+                today = QDate.currentDate()
+                y = today.year()
+                m = int(txt[:2]); d = int(txt[2:])
+                dt = QDate(y, m, d)
+            if dt is None:
+                dt = QDate.currentDate()
+            try:
+                target.setDate(dt)
+            except Exception:
+                pass
+        else:
+            super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index):  # type: ignore[override]
+        # Support both bare QDateEdit and our wrapped container
+        target = editor
+        if not isinstance(editor, QDateEdit):
+            try:
+                target = getattr(editor, "_date_edit", editor)
+            except Exception:
+                target = editor
+        if isinstance(target, QDateEdit):
+            try:
+                dt = target.date()  # type: ignore[attr-defined]
+                text = dt.toString("yyyy/MM/dd") if dt.isValid() else ""
+            except Exception:
+                text = ""
+            model.setData(index, text)
+        else:
+            super().setModelData(editor, model, index)
+
+
 def _detect_account_columns(tbl: 'QTableWidget') -> list[int]:  # type: ignore[name-defined]
     cols: list[int] = []
     try:
@@ -1351,6 +1492,37 @@ class SettingsPage(QWidget):
         self.llm_lora_path = QLineEdit()
         self.llm_prompt_template = QLineEdit()
         llm_form = QFormLayout()
+        try:
+            llm_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        except Exception:
+            pass
+        try:
+            # Add breathing room between rows and around the form
+            llm_form.setVerticalSpacing(10)
+            llm_form.setContentsMargins(8, 8, 8, 8)
+        except Exception:
+            pass
+        # Colab/remote settings and connectivity test
+        self.llm_use_colab = QLineEdit("0")
+        self.llm_remote_url = QLineEdit("https://nonbeneficent-oversoftly-piper.ngrok-free.dev")
+        try:
+            for w in (
+                self.llm_use_override,
+                self.llm_provider,
+                self.llm_model_path,
+                self.llm_device,
+                self.llm_n_gpu_layers,
+                self.llm_n_threads,
+                self.llm_lora_path,
+                self.llm_prompt_template,
+                self.llm_use_colab,
+                self.llm_remote_url,
+            ):
+                w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                w.setMinimumWidth(280)
+                w.setMinimumHeight(28)
+        except Exception:
+            pass
         llm_form.addRow("Override使用(1/0)", self.llm_use_override)
         llm_form.addRow("Provider", self.llm_provider)
         llm_form.addRow("Model(GGUF)", self.llm_model_path)
@@ -1359,13 +1531,26 @@ class SettingsPage(QWidget):
         llm_form.addRow("Threads", self.llm_n_threads)
         llm_form.addRow("LoRA Path", self.llm_lora_path)
         llm_form.addRow("Prompt Template", self.llm_prompt_template)
+        llm_form.addRow("Use Colab(1/0)", self.llm_use_colab)
+        _ping_row = QHBoxLayout()
+        _ping_row.addWidget(self.llm_remote_url)
+        _btn_ping = QPushButton("接続テスト")
+        _btn_ping.clicked.connect(self.on_llm_ping)  # type: ignore[arg-type]
+        try:
+            _btn_ping.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            _ping_row.addWidget(_btn_ping)
+            _ping_row.setStretch(0, 1)
+            _ping_row.setStretch(1, 0)
+        except Exception:
+            _ping_row.addWidget(_btn_ping)
+        _ping_container = QWidget(); _ping_container.setLayout(_ping_row)
+        llm_form.addRow("Remote URL", _ping_container)
         llm_save = QPushButton("LLM設定を保存")
         llm_save.clicked.connect(self.on_save_llm)  # type: ignore[arg-type]
         lg.addLayout(llm_form)
         lg.addWidget(llm_save)
         llm_group.setLayout(lg)
         layout.addWidget(llm_group)
-
         # LLM logs quick view
         logs_group = QGroupBox("LLMログ（最近）")
         lgl = QVBoxLayout()
@@ -1377,7 +1562,15 @@ class SettingsPage(QWidget):
         logs_group.setLayout(lgl)
         layout.addWidget(logs_group)
         layout.addStretch(1)
-        self.setLayout(layout)
+        # Wrap entire settings page in a scroll area to prevent vertical squeeze
+        try:
+            content = QWidget(); content.setLayout(layout)
+            scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(content)
+            outer = QVBoxLayout(); outer.addWidget(scroll)
+            self.setLayout(outer)
+        except Exception:
+            # Fallback: direct layout (non-scroll)
+            self.setLayout(layout)
         self.load_settings()
         self.load_llm_settings()
         self.load_llm_logs()
@@ -1392,7 +1585,7 @@ class SettingsPage(QWidget):
                 timeout=10,
             )
             if r.ok:
-                QMessageBox.information(self, "保存", "設定を保存しました")
+                QMessageBox.information(self, "保存", "LLM設定を保存しました")
             else:
                 QMessageBox.warning(self, "保存失敗", r.text)
         except Exception as e:
@@ -1422,7 +1615,7 @@ class SettingsPage(QWidget):
                 timeout=10,
             )
             if r.ok:
-                QMessageBox.information(self, "保存", "勘定科目設定を保存しました")
+                QMessageBox.information(self, "保存", "LLM設定を保存しました")
             else:
                 QMessageBox.warning(self, "保存失敗", r.text)
         except Exception as e:
@@ -1486,6 +1679,8 @@ class SettingsPage(QWidget):
                 "n_threads": int(self.llm_n_threads.text()) if self.llm_n_threads.text().strip() else 4,
                 "lora_path": self.llm_lora_path.text().strip() or None,
                 "prompt_template": self.llm_prompt_template.text().strip() or None,
+                "use_colab": (self.llm_use_colab.text().strip() == "1"),
+                "remote_base_url": (self.llm_remote_url.text().strip() or None),
             }
             r = requests.post(f"{API_URL}/company_llm_settings", json=payload, timeout=10)
             if r.ok:
@@ -1494,7 +1689,24 @@ class SettingsPage(QWidget):
                 QMessageBox.warning(self, "保存失敗", r.text)
         except Exception as e:
             QMessageBox.warning(self, "保存失敗", str(e))
-
+    def on_llm_ping(self) -> None:
+        url = (
+            (self.llm_remote_url.text() or "").strip()
+            or "https://nonbeneficent-oversoftly-piper.ngrok-free.dev"
+        )
+        try:
+            r = requests.post(f"{API_URL}/admin/llm_ping", json={"url": url}, timeout=5)
+            if not r.ok:
+                QMessageBox.warning(self, "接続テスト", f"失敗: {r.status_code} {r.text}")
+                return
+            data = r.json() or {}
+            if data.get("ok"):
+                ms = data.get("elapsed_ms")
+                QMessageBox.information(self, "接続テスト", f"接続成功: {data.get('url')} ({ms} ms)")
+            else:
+                QMessageBox.warning(self, "接続テスト", f"接続失敗: {data.get('url')}\n{data.get('detail') or ''}")
+        except Exception as e:
+            QMessageBox.warning(self, "接続テスト", f"エラー: {e}")
     def load_llm_logs(self) -> None:
         try:
             r = requests.get(f"{API_URL}/company_llm_logs", params={"company_name": self.company, "limit": 50}, timeout=10)
@@ -1520,12 +1732,12 @@ class SettingsPage(QWidget):
                 timeout=10,
             )
             if r.ok:
-                QMessageBox.information(self, "追加", "指示から会社別ルールを追加しました")
+                QMessageBox.information(self, "保存", "LLM設定を保存しました")
                 self.nl_instr_edit.setText("")
             else:
-                QMessageBox.warning(self, "追加失敗", r.text)
+                QMessageBox.warning(self, "保存失敗", r.text)
         except Exception as e:
-            QMessageBox.warning(self, "追加失敗", str(e))
+            QMessageBox.warning(self, "保存失敗", str(e))
 
 
 class OutputPage(QWidget):
@@ -1545,19 +1757,30 @@ class OutputPage(QWidget):
 
         self.info = QLabel()
         export_btn = QPushButton("弥生インポート形式で出力")
-        export_btn.clicked.connect(self.on_export)  # type: ignore[arg-type]
+        export_btn.clicked.connect(self.on_export2)  # type: ignore[arg-type]
 
         # Past exports list
         self.list_widget = QListWidget()
         refresh_btn = QPushButton("履歴を更新")
         refresh_btn.clicked.connect(self.refresh_history)  # type: ignore[arg-type]
+        open_btn = QPushButton("選択CSVを開く")
+        restore_btn = QPushButton("選択CSVの仕訳を確認済みに戻す")
+        try:
+            open_btn.clicked.connect(self.open_selected_csv)  # type: ignore[arg-type]
+            restore_btn.clicked.connect(self.restore_selected)  # type: ignore[arg-type]
+        except Exception:
+            pass
 
         layout.addLayout(dest_row)
         layout.addWidget(self.info)
         layout.addWidget(export_btn)
         layout.addWidget(QLabel("過去の出力"))
         layout.addWidget(self.list_widget)
-        layout.addWidget(refresh_btn)
+        row_hist = QHBoxLayout()
+        row_hist.addWidget(refresh_btn)
+        row_hist.addWidget(open_btn)
+        row_hist.addWidget(restore_btn)
+        layout.addLayout(row_hist)
         layout.addStretch(1)
         self.setLayout(layout)
         self.update_info()
@@ -1593,7 +1816,27 @@ class OutputPage(QWidget):
             r = requests.post(f"{API_URL}/export", params=params, timeout=60)
             if r.ok:
                 path = r.json().get("csv")
-                QMessageBox.information(self, "出力完了", f"出力しました:\n{path}")
+                QMessageBox.information(self, "保存", "LLM設定を保存しました")
+                self.refresh_history()
+            else:
+                QMessageBox.warning(self, "保存失敗", r.text)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失敗", str(e))
+
+    # New: clearer message when exporting confirmed journals
+    def on_export2(self) -> None:
+        dest = self.dest_edit.text().strip()
+        params = {"company_name": self.company}
+        if dest:
+            params["target_dir"] = dest
+        try:
+            # Ask server to produce UTF-8 with BOM for Excel compatibility
+            params["encoding"] = "utf-8"
+            params["bom"] = True
+            r = requests.post(f"{API_URL}/export", params=params, timeout=60)
+            if r.ok:
+                path = r.json().get("csv")
+                QMessageBox.information(self, "出力完了", f"確認済み仕訳を弥生インポート形式で出力しました。\n{path}")
                 self.refresh_history()
             else:
                 QMessageBox.warning(self, "出力失敗", r.text)
@@ -1620,6 +1863,32 @@ class OutputPage(QWidget):
                 self.list_widget.addItem(str(f))
         except Exception:
             pass
+
+    def open_selected_csv(self) -> None:
+        try:
+            it = self.list_widget.currentItem()
+            if not it:
+                return
+            import webbrowser
+            p = Path(it.text()).resolve()
+            webbrowser.open(str(p))
+        except Exception:
+            pass
+
+    def restore_selected(self) -> None:
+        it = self.list_widget.currentItem()
+        if not it:
+            return
+        csv_path = it.text().strip()
+        try:
+            r = requests.post(f"{API_URL}/export_restore", params={"csv_path": csv_path}, timeout=30)
+            if r.ok:
+                n = (r.json() or {}).get("restored")
+                QMessageBox.information(self, "復元完了", f"{n} 件を確認済みに戻しました")
+            else:
+                QMessageBox.warning(self, "復元失敗", r.text)
+        except Exception as e:
+            QMessageBox.warning(self, "復元失敗", str(e))
 
 
 class ScanPage(QWidget):
@@ -1652,13 +1921,16 @@ class ScanPage(QWidget):
 
         import_btn = QPushButton("PDF取込")
         import_dir_btn = QPushButton("フォルダ取込")
+        import_csv_btn = QPushButton("CSV/Excel取込")
         import_btn.clicked.connect(self.import_pdfs)  # type: ignore[arg-type]
         import_dir_btn.clicked.connect(self.import_folder)  # type: ignore[arg-type]
+        import_csv_btn.clicked.connect(self.import_csv_excel)  # type: ignore[arg-type]
         self.list_widget = QListWidget()
 
         row = QHBoxLayout()
         row.addWidget(import_btn)
         row.addWidget(import_dir_btn)
+        row.addWidget(import_csv_btn)
         layout.addLayout(row)
         layout.addWidget(QLabel("未確認データ"))
         layout.addWidget(self.list_widget)
@@ -1721,7 +1993,7 @@ class ScanPage(QWidget):
         base = Path(folder)
         files = [p for p in base.rglob("*.pdf")]
         if not files:
-            QMessageBox.information(self, "フォルダ取込", "PDFが見つかりませんでした")
+            QMessageBox.information(self, "保存", "LLM設定を保存しました")
             return
         prog = QProgressDialog("フォルダ取込中...", "中止", 0, len(files), self)
         prog.setWindowTitle("フォルダ取込 進捗")
@@ -1738,7 +2010,10 @@ class ScanPage(QWidget):
             except Exception:
                 pass
             prog.setValue(i + 1)
-            prog.setLabelText(p.name)
+            try:
+                prog.setLabelText(f"{i+1}/{len(files)}: {p.name}")
+            except Exception:
+                pass
             if prog.wasCanceled():
                 break
         self.refresh()
@@ -1750,6 +2025,65 @@ class ScanPage(QWidget):
             pass
         try:
             self.scan_status.setText(f"フォルダ取込 完了: {imported} 件")
+        except Exception:
+            pass
+
+    def import_csv_excel(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "CSV/Excelを選択",
+            str(Path.cwd()),
+            "CSV/Excel Files (*.csv *.tsv *.xlsx *.xls)"
+        )
+        if not files:
+            return
+        prog = QProgressDialog("取り込み中...", "中止", 0, len(files), self)
+        prog.setWindowTitle("CSV/Excel取込 進捗")
+        prog.setAutoClose(True); prog.setAutoReset(True)
+        imported = 0
+        for i, f in enumerate(files):
+            try:
+                suf = Path(f).suffix.lower()
+                mime = (
+                    "text/tab-separated-values" if suf == ".tsv" else
+                    "text/csv" if suf == ".csv" else
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if suf == ".xlsx" else
+                    "application/vnd.ms-excel"
+                )
+                with open(f, "rb") as fh:
+                    files_ = {"file": (Path(f).name, fh, mime)}
+                    data = {"company_name": self.company}
+                    r = requests.post(f"{API_URL}/transactions/import", data=data, files=files_, timeout=120)
+                    if r.ok:
+                        try:
+                            j = r.json()
+                            if isinstance(j, dict) and int(j.get("imported", 0)) > 0:
+                                imported += int(j.get("imported", 0))
+                            else:
+                                imported += 1
+                        except Exception:
+                            imported += 1
+                    else:
+                        QMessageBox.warning(self, "取込失敗", f"{Path(f).name}: {r.status_code}")
+            except Exception as e:
+                QMessageBox.warning(self, "取込失敗", f"{f}: {e}")
+            prog.setValue(i + 1)
+            try:
+                prog.setLabelText(Path(f).name)
+            except Exception:
+                pass
+            if prog.wasCanceled():
+                break
+        # リスト更新
+        self.refresh()
+        try:
+            win = self.window()
+            if hasattr(win, 'review_page'):
+                win.review_page.refresh()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        try:
+            self.scan_status.setText(f"CSV/Excel取込 完了: {imported} 行")
         except Exception:
             pass
 
@@ -1771,7 +2105,7 @@ class ScanPage(QWidget):
         try:
             ok = reserve_and_scan()
         except Exception as e:
-            QMessageBox.warning(self, "スキャン開始失敗", str(e))
+            QMessageBox.warning(self, "保存失敗", str(e))
 
         if not ok:
             QMessageBox.warning(self, "スキャン開始失敗", "ScanSnap Homeを起動できませんでした。")
@@ -1862,8 +2196,41 @@ class ReviewPage(QWidget):
             pass
         # 以降のスケーリングは設定値を基準に行う
         self._pdf_fixed_width = int(UI_SETTINGS.get("pdf_fixed_width", 420))
-        self._pdf_scale_ratio = float(UI_SETTINGS.get("pdf_scale_ratio", 1.25))
-        left.addWidget(self.pdf_label, 3)
+        self._pdf_scale_ratio = float(UI_SETTINGS.get("pdf_scale_ratio", 1.0))
+        self._default_pdf_ratio = float(UI_SETTINGS.get("pdf_scale_ratio", 1.0))
+        # ユーザーがズーム操作したかのフラグ（True なら枠をはみ出してもスクロール許可）
+        self._manual_zoom = False
+        # Put PDF label inside its own scroll area so zoom overflow scrolls
+        self.pdf_scroll = QScrollArea()
+        try:
+            self.pdf_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.pdf_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        except Exception:
+            pass
+        self.pdf_scroll.setWidget(self.pdf_label)
+        # For manual zoom, we will toggle widgetResizable(False) for natural-size scrolling
+        self.pdf_scroll.setWidgetResizable(False)
+        left.addWidget(self.pdf_scroll, 3)
+
+        # Zoom controls next to PDF frame
+        self.zoom_out_btn = QPushButton("縮小")
+        self.zoom_in_btn = QPushButton("拡大")
+        self.zoom_reset_btn = QPushButton("等倍")
+        self.zoom_auto_btn = QPushButton("自動フィット")
+        self.zoom_label = QLabel("100%")
+        try:
+            self.zoom_out_btn.clicked.connect(lambda: self._change_zoom(-0.1))  # type: ignore[arg-type]
+            self.zoom_in_btn.clicked.connect(lambda: self._change_zoom(0.1))   # type: ignore[arg-type]
+            self.zoom_reset_btn.clicked.connect(lambda: self._set_zoom(1.0))   # type: ignore[arg-type]
+            self.zoom_auto_btn.clicked.connect(self._auto_fit)                 # type: ignore[arg-type]
+        except Exception:
+            pass
+        pdf_zoom_row = QHBoxLayout()
+        pdf_zoom_row.addStretch(1)
+        pdf_zoom_row.addWidget(self.zoom_out_btn)
+        pdf_zoom_row.addWidget(self.zoom_label)
+        pdf_zoom_row.addWidget(self.zoom_in_btn)
+        left.addLayout(pdf_zoom_row)
 
         nl_group = QGroupBox("自然言語の指示（修正/仕訳）")
         try:
@@ -1922,6 +2289,9 @@ class ReviewPage(QWidget):
             pass
         left_scroll = QScrollArea(); left_scroll.setWidgetResizable(True)
         left_scroll.setWidget(left_container)
+        # Keep references for zoom behavior switching
+        self._left_scroll = left_scroll
+        self._left_container = left_container
         try:
             left_scroll.setMinimumWidth(int(UI_SETTINGS.get("left_scroll_min_width", 480)))
             mx = int(UI_SETTINGS.get("left_scroll_max_width", 0))
@@ -1930,13 +2300,18 @@ class ReviewPage(QWidget):
         except Exception:
             pass
         try:
-            left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         except Exception:
             pass
         # ビューポートのリサイズに追従してPDFのスケールを調整
         try:
             left_scroll.viewport().installEventFilter(self)
+        except Exception:
+            pass
+        try:
+            # Also resize on PDF viewport changes (e.g., splitter adjustments)
+            self.pdf_scroll.viewport().installEventFilter(self)
         except Exception:
             pass
 
@@ -1953,6 +2328,22 @@ class ReviewPage(QWidget):
             "摘要\n（税区分）",
             "請求書区分\n",
         ])
+        # Ensure two-line headers for account columns
+        try:
+            from PyQt6.QtWidgets import QTableWidgetItem
+            _hdr_labels = [
+                "日付",
+                "借方勘定科目\n（補助科目）",
+                "借方金額",
+                "貸方勘定科目\n（補助科目）",
+                "貸方金額",
+                "摘要",
+                "請求書区分",
+            ]
+            for _i, _t in enumerate(_hdr_labels):
+                self.table.setHorizontalHeaderItem(_i, QTableWidgetItem(_t))
+        except Exception:
+            pass
         self.table.horizontalHeader().setStretchLastSection(True)
         try:
             # make header tall enough to show two lines
@@ -1967,10 +2358,14 @@ class ReviewPage(QWidget):
         )
         self.table.itemSelectionChanged.connect(self._on_table_select)  # type: ignore[arg-type]
         self.table.itemChanged.connect(self._on_item_changed)  # type: ignore[arg-type]
-        # Install delegates and visible dropdowns directly on this table (debit=1, credit=3)
+        # Install delegates: date (0) uses calendar popup; accounts (1,3) use searchable dropdown
         try:
             names, token_map = _load_account_catalog()
             if names:
+                try:
+                    self.table.setItemDelegateForColumn(0, DateCellDelegate(self.table))
+                except Exception:
+                    pass
                 delegate = AccountCellDelegate(names, token_map, self.table)
                 try:
                     self.table.setItemDelegateForColumn(1, delegate)
@@ -1984,7 +2379,7 @@ class ReviewPage(QWidget):
         self.btn_save = QPushButton("保存/OK（学習）")
         self.btn_later = QPushButton("後で確認")
         self.btn_delete = QPushButton("削除")
-        self.btn_save.clicked.connect(self._save_selected)  # type: ignore[arg-type]
+        self.btn_save.clicked.connect(self._save_selected2)  # type: ignore[arg-type]
         self.btn_later.clicked.connect(self._mark_later)  # type: ignore[arg-type]
         self.btn_delete.clicked.connect(self._delete_selected)  # type: ignore[arg-type]
         btn_row.addWidget(self.btn_save)
@@ -2014,6 +2409,11 @@ class ReviewPage(QWidget):
         util_row.addWidget(self.pdf_prev)
         util_row.addWidget(self.pdf_page_label)
         util_row.addWidget(self.pdf_next)
+        # Place reset/auto-fit back on the right utility row
+        util_row.addSpacing(8)
+        util_row.addWidget(self.zoom_reset_btn)
+        util_row.addWidget(self.zoom_auto_btn)
+
         util_row.addWidget(self.page_prev)
         util_row.addWidget(self.page_label)
         util_row.addWidget(self.page_next)
@@ -2021,8 +2421,42 @@ class ReviewPage(QWidget):
         right = QVBoxLayout()
         right.addLayout(btn_row)
         right.addLayout(util_row)
+
+        # Row controls for multi-line support
+        row_ctrl = QHBoxLayout()
+        self.btn_add_pair = QPushButton("行追加")
+        self.btn_del_pair = QPushButton("選択行削除")
+        try:
+            self.btn_add_pair.clicked.connect(self._add_pair)  # type: ignore[arg-type]
+            self.btn_del_pair.clicked.connect(self._delete_pair)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        row_ctrl.addStretch(1)
+        row_ctrl.addWidget(self.btn_add_pair)
+        row_ctrl.addWidget(self.btn_del_pair)
+
+        right.addLayout(row_ctrl)
         right.addWidget(self.table)
         right_wrap = QWidget(); right_wrap.setLayout(right)
+
+        # Keyboard shortcuts for zoom
+        try:
+            QShortcut(QKeySequence.StandardKey.ZoomIn, self, activated=lambda: self._change_zoom(0.1))
+            QShortcut(QKeySequence.StandardKey.ZoomOut, self, activated=lambda: self._change_zoom(-0.1))
+        except Exception:
+            try:
+                QShortcut(QKeySequence("Ctrl++"), self, activated=lambda: self._change_zoom(0.1))
+                QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self._change_zoom(-0.1))
+            except Exception:
+                pass
+
+        # Initialize zoom label from current ratio without forcing a re-render
+        try:
+            current_ratio = float(getattr(self, "_pdf_scale_ratio", 1.0))
+            if hasattr(self, 'zoom_label') and isinstance(self.zoom_label, QLabel):
+                self.zoom_label.setText(f"{int(current_ratio * 100)}%")
+        except Exception:
+            pass
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         # 全画面時に左ペインが潰れてNL入力欄が見えなくなるのを防止
@@ -2402,7 +2836,7 @@ class ReviewPage(QWidget):
         self.table.setCellWidget(r1, 5, tcb)
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        if getattr(self, "_loading", False):
+        if getattr(self, "_loading", False) or getattr(self, "_syncing_amount", False):
             return
         r = item.row()
         c = item.column()
@@ -2435,8 +2869,91 @@ class ReviewPage(QWidget):
                 csub.clear(); csub.addItems([""] + list(getattr(self, "_acct_subs", {}).get(credit, [])))
             if isinstance(sum_cb, QComboBox):
                 sum_cb.clear(); sum_cb.addItems([""] + list(getattr(self, "_acct_summaries", {}).get(debit, [])))
+            return
+        # Mirror amount: when debit amount edited (top row, col=2), copy to credit amount (col=4)
+        if r % 2 == 0 and c == 2:
+            try:
+                txt = item.text()
+                self._syncing_amount = True
+                if self.table.item(r, 4) is None:
+                    self.table.setItem(r, 4, QTableWidgetItem(txt))
+                else:
+                    self.table.item(r, 4).setText(txt)
+            except Exception:
+                pass
+            finally:
+                self._syncing_amount = False
+            return
 
     # PDF preview helpers
+    def _add_pair(self) -> None:
+        try:
+            n = self.table.rowCount()
+        except Exception:
+            n = 0
+        # Append two rows for a new entry
+        new_r0 = n
+        new_r1 = n + 1
+        try:
+            self.table.setRowCount(n + 2)
+        except Exception:
+            return
+        # Map both rows to current doc id
+        try:
+            doc_id = int((getattr(self, "_row_to_id", [0]) or [0])[0])
+        except Exception:
+            doc_id = None
+        try:
+            if not hasattr(self, "_row_to_id"):
+                self._row_to_id = []
+            self._row_to_id.extend([doc_id, doc_id])
+        except Exception:
+            pass
+        # Initialize cells with blanks and widgets
+        try:
+            # default date to first row's date if any
+            date_txt = ""
+            if new_r0 >= 2 and self.table.item(0, 0):
+                date_txt = self.table.item(0, 0).text().strip()
+            for j in (0, 1, 2, 3, 4, 5, 6):
+                if j in (5, 6):
+                    continue
+                val = date_txt if j == 0 else ""
+                self.table.setItem(new_r0, j, QTableWidgetItem(val))
+            for j in (0, 2, 4, 6):
+                self.table.setItem(new_r1, j, QTableWidgetItem(""))
+            # Setup widgets on new pair
+            self._setup_row_widgets(new_r0, new_r1, "", "", "", "", "", "")
+        except Exception:
+            pass
+
+    def _delete_pair(self) -> None:
+        try:
+            n = self.table.rowCount()
+        except Exception:
+            n = 0
+        if n <= 2:
+            return  # keep at least one pair
+        sel = self.table.selectedIndexes()
+        if sel:
+            r = sel[0].row()
+        else:
+            r = n - 2  # last pair
+        r0 = r - (r % 2)
+        r1 = r0 + 1
+        try:
+            # Remove bottom row first
+            self.table.removeRow(r1)
+            self.table.removeRow(r0)
+            try:
+                # Remove mapping entries
+                if hasattr(self, "_row_to_id"):
+                    del self._row_to_id[r0:r0+2]
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _show_pdf(self, path: Optional[str]) -> None:
         self._pdf_path = path or None
         self._pdf_page = getattr(self, '_pdf_page', 0)
@@ -2472,20 +2989,15 @@ class ReviewPage(QWidget):
             pm = QPixmap.fromImage(img)
             # ビューポート幅×倍率(既定1.25)を狙いつつ、縦スクロールが出ないよう高さ制約も反映
             try:
-                vp = None
-                # 直近で作ったスクロールを検索
-                p = self.pdf_label.parent()
-                while p is not None and not isinstance(p, QScrollArea):
-                    p = p.parent()
-                if isinstance(p, QScrollArea):
-                    vp = p.viewport()
+                vp = getattr(self, 'pdf_scroll', None)
+                vp = vp.viewport() if vp is not None else None
                 avail_w = vp.width() if vp is not None else self.pdf_label.width()
                 avail_h = vp.height() if vp is not None else self.pdf_label.height()
             except Exception:
                 avail_w = self.pdf_label.width()
                 avail_h = self.pdf_label.height()
             try:
-                ratio = float(getattr(self, "_pdf_scale_ratio", 1.25))
+                ratio = float(getattr(self, "_pdf_scale_ratio", 1.0))
                 # 設定による下限/上限
                 rmin = float(UI_SETTINGS.get("pdf_scale_ratio_min", 0.0))
                 rmax = float(UI_SETTINGS.get("pdf_scale_ratio_max", 0.0))
@@ -2495,7 +3007,8 @@ class ReviewPage(QWidget):
                     ratio = min(rmax, ratio)
             except Exception:
                 ratio = 1.25
-            # 希望倍率(1.25)を優先しつつ、ビューポート幅の98%を上限にして横スクロールを回避
+            # 希望倍率(既定1.25)を優先。ユーザーがズーム操作した場合は枠超過を許容しスクロールで対応
+            manual = bool(getattr(self, "_manual_zoom", False))
             fixed_min = getattr(self, "_pdf_fixed_width", 420)
             desired_w = int(avail_w * ratio)
             max_w_by_width = int(avail_w * 0.98)
@@ -2525,26 +3038,56 @@ class ReviewPage(QWidget):
             except Exception:
                 max_w_by_height = max_w_by_width
             hard_max_w = max(100, min(max_w_by_width, max_w_by_height))
-            # 追加の上限（絶対px）
-            try:
-                max_px = int(UI_SETTINGS.get("pdf_max_width_px", 0))
-                if max_px and max_px > 0:
-                    hard_max_w = min(hard_max_w, max_px)
-            except Exception:
-                pass
-            target = int(max(fixed_min, min(desired_w, hard_max_w)))
-            w = max(320, target)
-            # 高さの上限に確実に収めるため、幅と高さの両方を指定したスケールを用いる
-            try:
-                from PyQt6.QtCore import Qt as _Qt
-                pm = pm.scaled(w, int(allowed_h), _Qt.AspectRatioMode.KeepAspectRatio, _Qt.TransformationMode.SmoothTransformation)
-            except Exception:
-                pm = pm.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
-            # ラベル自体の高さ上限も設定して、NL欄が初期から見えるようにする
-            try:
-                self.pdf_label.setMaximumHeight(int(allowed_h))
-            except Exception:
-                pass
+            if manual:
+                # ユーザーの明示ズーム: ビューポート制約を外し、スクロール前提で幅優先
+                try:
+                    sc = getattr(self, '_left_scroll', None)
+                    if sc is not None:
+                        sc.setWidgetResizable(False)
+                except Exception:
+                    pass
+                # 100% = レンダリング基準ピクセル幅
+                base_w = int(pm.width())
+                w = max(1, int(base_w * max(0.1, ratio)))
+                try:
+                    from PyQt6.QtCore import Qt as _Qt
+                    pm = pm.scaledToWidth(w, _Qt.TransformationMode.SmoothTransformation)
+                except Exception:
+                    pm = pm.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
+                try:
+                    # 無制限に戻す（Qt のデフォルト最大値）
+                    self.pdf_label.setMaximumHeight(16777215)
+                    # ラベル最小サイズをピクセルに合わせ、スクロールを促す
+                    self.pdf_label.setMinimumSize(pm.width(), pm.height())
+                except Exception:
+                    pass
+            else:
+                # 自動フィット: 横スクロール回避、縦はNL欄確保
+                try:
+                    sc = getattr(self, '_left_scroll', None)
+                    if sc is not None:
+                        sc.setWidgetResizable(True)
+                except Exception:
+                    pass
+                # 追加の上限（絶対px）
+                try:
+                    max_px = int(UI_SETTINGS.get("pdf_max_width_px", 0))
+                    if max_px and max_px > 0:
+                        hard_max_w = min(hard_max_w, max_px)
+                except Exception:
+                    pass
+                target = int(max(fixed_min, min(desired_w, hard_max_w)))
+                w = max(320, target)
+                try:
+                    from PyQt6.QtCore import Qt as _Qt
+                    pm = pm.scaled(w, int(allowed_h), _Qt.AspectRatioMode.KeepAspectRatio, _Qt.TransformationMode.SmoothTransformation)
+                except Exception:
+                    pm = pm.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
+                try:
+                    self.pdf_label.setMaximumHeight(int(allowed_h))
+                    self.pdf_label.setMinimumSize(0, 0)
+                except Exception:
+                    pass
             self.pdf_label.setPixmap(pm)
             # Update intra-PDF page position label (keep doc navigation label separate)
             try:
@@ -2577,6 +3120,49 @@ class ReviewPage(QWidget):
             self._show_pdf(self._pdf_path)
         except Exception:
             pass
+
+    def _set_zoom(self, ratio: float) -> None:
+        try:
+            rmin = float(UI_SETTINGS.get("pdf_scale_ratio_min", 0.0))
+            rmax = float(UI_SETTINGS.get("pdf_scale_ratio_max", 0.0))
+        except Exception:
+            rmin = 0.0
+            rmax = 0.0
+        # Fallback bounds if settings are unset
+        if not rmin:
+            rmin = 0.1
+        if not rmax:
+            rmax = 5.0
+        ratio = max(rmin, min(float(ratio), rmax))
+        self._pdf_scale_ratio = ratio
+        # ユーザー操作によるズームを有効化（スクロール許容）
+        self._manual_zoom = True
+        try:
+            if hasattr(self, 'zoom_label'):
+                self.zoom_label.setText(f"{int(ratio * 100)}%")
+        except Exception:
+            pass
+        if getattr(self, "_pdf_path", None):
+            self._show_pdf(self._pdf_path)
+
+    def _change_zoom(self, delta: float) -> None:
+        current = float(getattr(self, "_pdf_scale_ratio", 1.25))
+        self._set_zoom(current + float(delta))
+
+    def _auto_fit(self) -> None:
+        # Return to auto-fit mode using default ratio
+        try:
+            self._pdf_scale_ratio = float(getattr(self, "_default_pdf_ratio", 1.0))
+        except Exception:
+            self._pdf_scale_ratio = 1.0
+        self._manual_zoom = False
+        try:
+            if hasattr(self, 'zoom_label'):
+                self.zoom_label.setText(f"{int(self._pdf_scale_ratio * 100)}%")
+        except Exception:
+            pass
+        if getattr(self, "_pdf_path", None):
+            self._show_pdf(self._pdf_path)
 
     # ビューポート/ウィンドウのリサイズでプレビューを再スケール
     def eventFilter(self, obj, event):  # type: ignore[override]
@@ -2615,14 +3201,23 @@ class ReviewPage(QWidget):
     # Save/later/delete
     def _selected_doc_id_and_rows(self) -> tuple[Optional[int], Optional[int], Optional[int]]:
         sel = self.table.selectedIndexes()
-        if not sel:
-            return None, None, None
-        r = sel[0].row()
-        # Normalize to top row of pair
-        r0 = r - (r % 2)
-        r1 = r0 + 1
-        doc_id = self._row_to_id[r0]
-        return doc_id, r0, r1
+        if sel:
+            r = sel[0].row()
+            # Normalize to top row of pair
+            r0 = r - (r % 2)
+            r1 = r0 + 1
+            try:
+                doc_id = self._row_to_id[r0]
+            except Exception:
+                doc_id = None
+            return doc_id, r0, r1
+        # No selection: treat the currently displayed PDF's two rows as selected
+        try:
+            if self.table.rowCount() >= 2 and len(getattr(self, "_row_to_id", []) or []) >= 2:
+                return int(self._row_to_id[0]), 0, 1
+        except Exception:
+            pass
+        return None, None, None
 
     def _collect_from_table(self, r0: int, r1: int) -> dict:
         # Extract values from pair rows
@@ -2667,10 +3262,25 @@ class ReviewPage(QWidget):
             "invoice_status": invoice or (tax_text or None),
         }
 
+    def _collect_all_pairs(self) -> list[dict]:
+        """Collect all row pairs (0-1, 2-3, ...) into a list of payload dicts."""
+        out: list[dict] = []
+        try:
+            n = self.table.rowCount()
+        except Exception:
+            n = 0
+        for r0 in range(0, max(0, n - 1), 2):
+            r1 = r0 + 1
+            try:
+                out.append(self._collect_from_table(r0, r1))
+            except Exception:
+                continue
+        return out
+
     def _save_selected(self) -> None:
         doc_id, r0, r1 = self._selected_doc_id_and_rows()
         if doc_id is None or r0 is None or r1 is None:
-            QMessageBox.information(self, "保存", "行を選択してください")
+            QMessageBox.information(self, "保存", "LLM設定を保存しました")
             return
         data = self._collect_from_table(r0, r1)
         try:
@@ -2699,12 +3309,118 @@ class ReviewPage(QWidget):
                 timeout=20,
             )
             if r.ok:
-                QMessageBox.information(self, "保存", "仕訳を保存（学習）しました")
+                QMessageBox.information(self, "保存", "LLM設定を保存しました")
                 self._load_unconfirmed()
                 try:
                     win = self.window()
                     if hasattr(win, 'scan_page'):
                         win.scan_page.refresh()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            else:
+                QMessageBox.warning(self, "保存失敗", r.text)
+        except Exception as e:
+            QMessageBox.warning(self, "保存失敗", str(e))
+
+    # New: clearer OK handling with proper messages and confirmed refresh
+    def _save_selected2(self) -> None:
+        doc_id, r0, r1 = self._selected_doc_id_and_rows()
+        if doc_id is None:
+            QMessageBox.information(self, "確認", "対象を選択してください")
+            return
+        # If more than one pair exists, send all pairs in one request
+        try:
+            row_cnt = self.table.rowCount()
+        except Exception:
+            row_cnt = 0
+        multi = row_cnt >= 4  # 2 pairs or more
+        if multi:
+            entries = []
+            for d in self._collect_all_pairs():
+                entries.append(
+                    {
+                        "date": d.get("date"),
+                        "amount": d.get("amount"),
+                        "summary": d.get("summary"),
+                        "debit_account": d.get("debit"),
+                        "credit_account": d.get("credit"),
+                    }
+                )
+            try:
+                r = requests.post(
+                    f"{API_URL}/documents/{doc_id}/ok_multi",
+                    json={"entries": entries},
+                    timeout=30,
+                )
+                if r.ok:
+                    path = None
+                    try:
+                        path = (r.json() or {}).get("csv")
+                    except Exception:
+                        path = None
+                    if path:
+                        QMessageBox.information(self, "確認", f"仕訳を確認済みに移動しました。\n複数行CSVを出力しました:\n{path}")
+                    else:
+                        QMessageBox.information(self, "確認", "仕訳を確認済みに移動しました。")
+                    self._load_unconfirmed()
+                    try:
+                        win = self.window()
+                        if hasattr(win, 'scan_page'):
+                            win.scan_page.refresh()  # type: ignore[attr-defined]
+                        if hasattr(win, 'confirmed_page'):
+                            win.confirmed_page.refresh()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                else:
+                    QMessageBox.warning(self, "保存失敗", r.text)
+            except Exception as e:
+                QMessageBox.warning(self, "保存失敗", str(e))
+            return
+
+        # Single pair: old behavior
+        data = self._collect_from_table(r0, r1)
+        try:
+            payload = {
+                "date": data["date"],
+                "amount": data["amount"],
+                "summary": data["summary"],
+                "debit": data["debit"],
+                "credit": data["credit"],
+                "debit_sub": data["debit_sub"],
+                "credit_sub": data["credit_sub"],
+                "invoice_status": data["invoice_status"],
+            }
+            r = requests.post(
+                f"{API_URL}/documents/{doc_id}/ok",
+                json={
+                    "date": payload.get("date"),
+                    "amount": payload.get("amount"),
+                    "summary": payload.get("summary"),
+                    "debit_account": payload.get("debit"),
+                    "credit_account": payload.get("credit"),
+                    "debit_subaccount": payload.get("debit_sub"),
+                    "credit_subaccount": payload.get("credit_sub"),
+                    "invoice_status": payload.get("invoice_status"),
+                },
+                timeout=20,
+            )
+            if r.ok:
+                path = None
+                try:
+                    path = (r.json() or {}).get("csv")
+                except Exception:
+                    path = None
+                if path:
+                    QMessageBox.information(self, "確認", f"仕訳を確認済みに移動しました。\n1行CSVを出力しました:\n{path}")
+                else:
+                    QMessageBox.information(self, "確認", "仕訳を確認済みに移動しました。")
+                self._load_unconfirmed()
+                try:
+                    win = self.window()
+                    if hasattr(win, 'scan_page'):
+                        win.scan_page.refresh()  # type: ignore[attr-defined]
+                    if hasattr(win, 'confirmed_page'):
+                        win.confirmed_page.refresh()  # type: ignore[attr-defined]
                 except Exception:
                     pass
             else:
@@ -2729,18 +3445,47 @@ class ReviewPage(QWidget):
             pass
 
     def _delete_selected(self) -> None:
+        # Prefer table selection; if none, use current doc in view
         doc_id, _, _ = self._selected_doc_id_and_rows()
         if doc_id is None:
+            try:
+                idx = int(getattr(self, "_doc_index", 0))
+                docs = list(getattr(self, "_docs", []) or [])
+                if 0 <= idx < len(docs):
+                    doc_id = int(docs[idx].get("id"))
+            except Exception:
+                doc_id = None
+        if not doc_id:
             return
+        # Confirm delete
+        try:
+            resp = QMessageBox.question(
+                self,
+                "削除の確認",
+                "この仕訳を削除しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+        except Exception:
+            pass
+        # Delete via API and refresh
         try:
             requests.delete(f"{API_URL}/documents/{doc_id}", timeout=10)
+        except Exception:
+            pass
+        try:
+            # Keep index in range after deletion
+            curr = int(getattr(self, "_doc_index", 0))
+            total = max(0, len(getattr(self, "_docs", []) or []) - 1)
+            setattr(self, "_doc_index", max(0, min(curr, total)))
+        except Exception:
+            pass
+        try:
             self._load_unconfirmed()
-            try:
-                win = self.window()
-                if hasattr(win, 'scan_page'):
-                    win.scan_page.refresh()  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            win = self.window()
+            if hasattr(win, 'scan_page'):
+                win.scan_page.refresh()  # type: ignore[attr-defined]
         except Exception:
             pass
 
@@ -2759,15 +3504,15 @@ class ReviewPage(QWidget):
                 timeout=15,
             )
             if r.ok:
-                QMessageBox.information(self, "学習", "自然言語の指示を学習しました")
+                QMessageBox.information(self, "保存", "LLM設定を保存しました")
                 try:
                     self.nl_edit.setPlainText("")
                 except Exception:
                     self.nl_edit.setText("")
             else:
-                QMessageBox.warning(self, "学習失敗", r.text)
+                QMessageBox.warning(self, "保存失敗", r.text)
         except Exception as e:
-            QMessageBox.warning(self, "学習失敗", str(e))
+            QMessageBox.warning(self, "保存失敗", str(e))
 
     def refresh(self) -> None:
         # リスト表示は廃止。未確定データをテーブルに再読込。
@@ -2843,9 +3588,9 @@ class ReviewPage(QWidget):
             timeout=20,
         )
         if r.ok:
-            QMessageBox.information(self, "保存", "確定・学習しました")
+            QMessageBox.information(self, "保存", "LLM設定を保存しました")
         else:
-            QMessageBox.warning(self, "エラー", r.text)
+            QMessageBox.warning(self, "保存失敗", r.text)
         self.refresh()
 
     def on_delete(self) -> None:
@@ -2870,6 +3615,30 @@ class CheckPage(QWidget):
         self.list_widget.clear()
         try:
             resp = requests.get(f"{API_URL}/documents", params={"company_name": self.company, "status": "check_later"}, timeout=10)
+            for item in resp.json():
+                self.list_widget.addItem(f"#{item['id']} - {Path(item['file_path']).name}")
+        except Exception:
+            pass
+
+
+class ConfirmedPage(QWidget):
+    def __init__(self, company: str) -> None:
+        super().__init__()
+        self.company = company
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("確認済み仕訳"))
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget)
+        refresh_btn = QPushButton("更新")
+        refresh_btn.clicked.connect(self.refresh)  # type: ignore[arg-type]
+        layout.addWidget(refresh_btn)
+        self.setLayout(layout)
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.list_widget.clear()
+        try:
+            resp = requests.get(f"{API_URL}/documents", params={"company_name": self.company, "status": "confirmed"}, timeout=10)
             for item in resp.json():
                 self.list_widget.addItem(f"#{item['id']} - {Path(item['file_path']).name}")
         except Exception:
@@ -2976,12 +3745,14 @@ class MainWindow(QMainWindow):
         self.scan_page = ScanPage(company)
         self.review_page = ReviewPage(company)
         self.check_page = CheckPage(company)
+        self.confirmed_page = ConfirmedPage(company)
         self.output_page = OutputPage(company)
         self.dup_page = DuplicatesPage(company)
         self.settings_page = SettingsPage(company)
         self.stack.addWidget(self.scan_page)
         self.stack.addWidget(self.review_page)
         self.stack.addWidget(self.check_page)
+        self.stack.addWidget(self.confirmed_page)
         self.stack.addWidget(self.output_page)
         self.stack.addWidget(self.dup_page)
         self.stack.addWidget(self.settings_page)
@@ -3025,6 +3796,9 @@ class MainWindow(QMainWindow):
         act_export.triggered.connect(self.show_output)  # type: ignore[arg-type]
         act_dup.triggered.connect(self.show_dup)  # type: ignore[arg-type]
         act_settings.triggered.connect(self.show_settings)  # type: ignore[arg-type]
+        # Add Confirmed list menu
+        act_confirmed = menubar.addAction("確認済み仕訳")
+        act_confirmed.triggered.connect(self.show_confirmed)  # type: ignore[arg-type]
 
     def show_scan(self) -> None:
         self.stack.setCurrentIndex(0)
@@ -3036,6 +3810,11 @@ class MainWindow(QMainWindow):
             names, token_map = _load_account_catalog()
             if names and hasattr(self, 'review_page'):
                 for tbl in getattr(self.review_page, 'findChildren', lambda *_: [])(QTableWidget):  # type: ignore[name-defined]
+                    try:
+                        # Date column calendar
+                        tbl.setItemDelegateForColumn(0, DateCellDelegate(tbl))
+                    except Exception:
+                        pass
                     try:
                         delegate = AccountCellDelegate(names, token_map, tbl)
                         tbl.setItemDelegateForColumn(1, delegate)
@@ -3050,8 +3829,23 @@ class MainWindow(QMainWindow):
 
     def show_output(self) -> None:
         # Update label to reflect any settings change
-        self.output_page.update_info()
-        self.stack.setCurrentIndex(3)
+        try:
+            self.output_page.update_info()
+        except Exception:
+            pass
+        # Navigate using indexOf to avoid mismatch when page order changes
+        idx = self.stack.indexOf(self.output_page)
+        if idx >= 0:
+            self.stack.setCurrentIndex(idx)
+
+    def show_confirmed(self) -> None:
+        try:
+            self.confirmed_page.refresh()
+        except Exception:
+            pass
+        idx = self.stack.indexOf(self.confirmed_page)
+        if idx >= 0:
+            self.stack.setCurrentIndex(idx)
 
     def show_settings(self) -> None:
         idx = self.stack.indexOf(self.settings_page)
@@ -3086,12 +3880,14 @@ class MainWindow(QMainWindow):
                     self.scan_page = ScanPage(self.company)
                     self.review_page = ReviewPage(self.company)
                     self.check_page = CheckPage(self.company)
+                    self.confirmed_page = ConfirmedPage(self.company)
                     self.output_page = OutputPage(self.company)
                     self.dup_page = DuplicatesPage(self.company)
                     self.settings_page = SettingsPage(self.company)
                     new_stack.addWidget(self.scan_page)
                     new_stack.addWidget(self.review_page)
                     new_stack.addWidget(self.check_page)
+                    new_stack.addWidget(self.confirmed_page)
                     new_stack.addWidget(self.output_page)
                     new_stack.addWidget(self.dup_page)
                     new_stack.addWidget(self.settings_page)
@@ -3128,3 +3924,8 @@ def run_ui() -> None:
 
 if __name__ == "__main__":
     run_ui()
+
+
+
+
+

@@ -75,6 +75,7 @@ class DocumentStatusEnum(str, PyEnum):  # type: ignore[misc]
     UNCONFIRMED = "unconfirmed"
     CHECK_LATER = "check_later"
     CONFIRMED = "confirmed"
+    EXPORTED = "exported"
 
 
 class Document(Base):
@@ -109,6 +110,20 @@ class AutoResult(Base):
     invoice_status: Mapped[Optional[str]] = mapped_column(String(16), default=None)  # 適格/非適格/非課税
 
     document: Mapped[Document] = relationship(back_populates="auto_result")
+
+
+class AutoResultLine(Base):
+    __tablename__ = "auto_result_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    line_no: Mapped[int] = mapped_column(Integer, default=1)
+    date: Mapped[Optional[str]] = mapped_column(String(10))  # YYYY/MM/DD
+    amount: Mapped[Optional[int]] = mapped_column(Integer)
+    summary: Mapped[Optional[str]] = mapped_column(String(128))
+    debit_account: Mapped[Optional[str]] = mapped_column(String(64))
+    credit_account: Mapped[Optional[str]] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class CorrectionActionEnum(str, PyEnum):  # type: ignore[misc]

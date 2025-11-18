@@ -1,0 +1,31 @@
+[YOMITOKU] start: data\uploads\20250318_天王寺店.pdf
+[YOMITOKU] using Python package
+[YOMITOKU] copied to temp ASCII path: data\uploads\yomitoku_output\yomi_cli_v7qiv8ei\input.pdf
+[YOMITOKU] CLI: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE
+[YOMITOKU] OutDir: data\uploads\yomitoku_output
+[YOMITOKU] Cmd: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE data\uploads\yomitoku_output\yomi_cli_v7qiv8ei\input.pdf -f md --combine --encoding utf-8 -o data\uploads\yomitoku_output
+[YOMITOKU] CLI returncode: 0
+
+----- CLI STDOUT -----
+
+
+----- CLI STDERR -----
+2025-11-06 11:43:26,036 - yomitoku.base - INFO - Initialize TextDetector
+2025-11-06 11:43:28,282 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 11:43:28,282 - yomitoku.base - INFO - Initialize TextRecognizer
+2025-11-06 11:43:29,978 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 11:43:29,980 - yomitoku.base - INFO - Initialize LayoutParser
+2025-11-06 11:43:31,320 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 11:43:31,333 - yomitoku.base - INFO - Initialize TableStructureRecognizer
+2025-11-06 11:43:32,638 - yomitoku.base - WARNING - CUDA is not available. Use CPU instead.
+2025-11-06 11:43:32,658 - yomitoku.cli.main - INFO - Output directory: data\uploads\yomitoku_output
+2025-11-06 11:43:32,660 - yomitoku.cli.main - INFO - Processing file: data\uploads\yomitoku_output\yomi_cli_v7qiv8ei\input.pdf
+2025-11-06 11:43:34,970 - yomitoku.base - INFO - LayoutParser __call__ elapsed_time: 2.2514560222625732
+2025-11-06 11:43:34,978 - yomitoku.base - INFO - TableStructureRecognizer __call__ elapsed_time: 0.008047342300415039
+2025-11-06 11:43:36,619 - yomitoku.base - INFO - TextDetector __call__ elapsed_time: 3.901437520980835
+2025-11-06 11:43:41,381 - yomitoku.base - INFO - TextRecognizer __call__ elapsed_time: 4.762094259262085
+2025-11-06 11:43:41,390 - yomitoku.cli.main - INFO - Total Processing time: 8.73 sec
+
+[YOMITOKU] collected: yomi_cli_v7qiv8ei_input.md (243 chars)
+[YOMITOKU] total collected text: 243 chars
+[YOMITOKU] done

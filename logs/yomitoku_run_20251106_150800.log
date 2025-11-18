@@ -1,0 +1,15 @@
+[YOMITOKU] start: data\uploads\20250319_ミーツサンエー平野店.pdf
+[YOMITOKU] using Python package
+[YOMITOKU] CLI: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE
+[YOMITOKU] OutDir: data\uploads\yomitoku_output\20250319____________20251106_150800_8445
+[YOMITOKU] Cmd: C:\jidoushiwake\.venv\Scripts\yomitoku.EXE data\uploads\20250319_ミーツサンエー平野店.pdf -f md --combine --encoding utf-8 -o data\uploads\yomitoku_output\20250319____________20251106_150800_8445
+[YOMITOKU] CLI returncode: 0
+
+----- CLI STDOUT -----
+
+
+----- CLI STDERR -----
+
+[YOMITOKU] collected: uploads_20250319_ミーツサンエー平野店.md (476 chars)
+[YOMITOKU] total collected text: 476 chars
+[YOMITOKU] done

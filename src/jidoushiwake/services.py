@@ -15,6 +15,7 @@ from .config import get_settings
 from .db import get_session, engine, Base
 from .models import (
     AutoResult,
+    AutoResultLine,
     Company,
     Correction,
     CorrectionActionEnum,
@@ -31,7 +32,7 @@ from .models import (
 )
 from .ocr_extract import extract_text_from_pdf, extract_journal_data, extract_text_both
 from .yayoi_exporter import AccountSide, JournalEntry, JournalExporter
-from .llm_client import refine_extraction
+from .llm_client import refine_extraction, refine_extraction_with_yomi
 from .llm_client import parse_nl_rule
 
 
@@ -143,24 +144,19 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
                 lora_path=c_llm.lora_path,
                 prompt_template=c_llm.prompt_template,
                 use_colab_remote=bool(getattr(c_llm, "use_colab_remote", getattr(c_llm, "use_colab", 0)) or False),
-                remote_base_url=(getattr(c_llm, "remote_base_url", None) or os.getenv("JIDOU_LLM_REMOTE_BASE") or "http://localhost:8005"),
+                remote_base_url=(
+                    getattr(c_llm, "remote_base_url", None)
+                    or os.getenv("JIDOU_LLM_REMOTE_BASE")
+                    or "https://nonbeneficent-oversoftly-piper.ngrok-free.dev"
+                ),
             )
             with temporary_config(cfg):
-                # Feed YOMITOKU first (if available) in the image OCR slot to prioritize it.
-                _pdf_for_llm = texts.get("text_pdf") or ""
-                _img_for_llm = (texts.get("text_yomitoku") or "").strip()
-                llm_ref = refine_extraction(_pdf_for_llm, _img_for_llm)
+                llm_ref = _run_llm_refine_paginated(session, company_id, texts)
         else:
-            _pdf_for_llm = texts.get("text_pdf") or ""
-            _img_for_llm = (texts.get("text_yomitoku") or "").strip()
-            llm_ref = refine_extraction(_pdf_for_llm, _img_for_llm)
+            llm_ref = _run_llm_refine_paginated(session, company_id, texts)
         if llm_ref:
             parsed.date = llm_ref.get("date") or parsed.date
-            try:
-                amt = llm_ref.get("amount")
-                parsed.amount = int(amt) if amt is not None else parsed.amount
-            except Exception:
-                pass
+            # AmountはYOMITOKUヒューリスティックの結果を優先し、LLMの推測では上書きしない
             parsed.summary = llm_ref.get("summary") or parsed.summary
             parsed.debit_account = llm_ref.get("debit_account") or parsed.debit_account
             parsed.credit_account = llm_ref.get("credit_account") or parsed.credit_account
@@ -257,6 +253,316 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
     return doc
 
 
+def _norm_date_str(s: str | None) -> str | None:
+    """Normalize various date strings to 'YYYY/MM/DD'. Returns None on failure.
+
+    Accepts common Japanese formats like 'YYYY-MM-DD', 'YYYY/MM/DD',
+    'YYYY年M月D日', 'YY/MM/DD', and compacts without leading zeros.
+    """
+    if not s:
+        return None
+    t = (s or "").strip()
+    if not t:
+        return None
+    import re as _re
+    try:
+        # 年月日形式
+        m = _re.match(r"^(\d{4})[年/\-](\d{1,2})[月/\-](\d{1,2})日?$", t)
+        if m:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+        # 2桁年 -> 2000年代と仮定
+        m = _re.match(r"^(\d{2})[年/\-](\d{1,2})[月/\-](\d{1,2})日?$", t)
+        if m:
+            y, mo, d = 2000 + int(m.group(1)), int(m.group(2)), int(m.group(3))
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+        # 8桁 or 6桁(YYMMDD)
+        m = _re.match(r"^(\d{8})$", t)
+        if m:
+            y = int(t[0:4]); mo = int(t[4:6]); d = int(t[6:8])
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+        m = _re.match(r"^(\d{6})$", t)
+        if m:
+            y = 2000 + int(t[0:2]); mo = int(t[2:4]); d = int(t[4:6])
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+        # fallback: split by non-digits
+        parts = [p for p in _re.split(r"\D+", t) if p]
+        if len(parts) >= 3:
+            y = int(parts[0]); mo = int(parts[1]); d = int(parts[2])
+            if y < 100:
+                y += 2000
+            return f"{y:04d}/{mo:02d}/{d:02d}"
+    except Exception:
+        return None
+    return None
+
+
+def _int_from_amount_like(v: object) -> int | None:
+    """Convert various amount-like values to int. Returns None if not parseable."""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, (int,)):
+            return int(v)
+        s = str(v).strip()
+        if not s:
+            return None
+        # remove currency and commas
+        import re as _re
+        s = _re.sub(r"[円,\s\\]", "", s)
+        # parentheses as negative
+        neg = s.startswith("(") and s.endswith(")")
+        s = s.strip("()")
+        if s in ("-", ""):
+            return None
+        x = int(float(s))
+        return -x if neg else x
+    except Exception:
+        return None
+
+
+def import_transactions_table(
+    session: Session,
+    company_id: int,
+    rows: list[dict[str, object]],
+    source_path: Path,
+) -> int:
+    """Import bank/card transaction rows as Documents + AutoResults.
+
+    This creates one Document per row, stores a synthesized text in `ocr_text`
+    for downstream rule matching, and fills AutoResult fields from columns.
+    """
+    # Preload rules/mappings once
+    from sqlalchemy import select as _select
+    gr_list: list[GlobalRule] = []
+    try:
+        for gr in session.scalars(
+            _select(GlobalRule).where(GlobalRule.enabled == 1).order_by(GlobalRule.priority.desc(), GlobalRule.id.asc())
+        ):
+            gr_list.append(gr)
+    except Exception:
+        gr_list = []
+    km_list: list[KeywordMapping] = list(session.scalars(_select(KeywordMapping).where(KeywordMapping.company_id == company_id)))
+
+    def _get_first(row: dict[str, object], keys: list[str]) -> str | None:
+        for k in keys:
+            for kk in (k, k.lower(), k.upper()):
+                if kk in row and row[kk] is not None:
+                    s = str(row[kk]).strip()
+                    if s:
+                        return s
+        return None
+
+    imported = 0
+    for idx, row in enumerate(rows):
+        # Normalize keys: keep original and lower
+        norm_row: dict[str, object] = {}
+        for k, v in list(row.items()):
+            norm_row[k] = v
+            if isinstance(k, str):
+                lk = k.strip().lower()
+                if lk and lk not in norm_row:
+                    norm_row[lk] = v
+
+        date_raw = _get_first(
+            norm_row,
+            [
+                "日付",
+                "取引日",
+                "年月日",
+                "date",
+                "transaction date",
+                "value date",
+                "取引年月日",
+            ],
+        )
+        date = _norm_date_str(date_raw) if date_raw else None
+
+        # Amount: prefer single '金額/amount'; else compute deposit - withdrawal
+        amount = None
+        amount = _int_from_amount_like(
+            _get_first(norm_row, ["金額", "amount", "ご利用金額", "利用金額", "出金額", "支出", "withdrawal"])
+        )
+        if amount is None:
+            dep = _int_from_amount_like(_get_first(norm_row, ["入金額", "収入", "deposit"])) or 0
+            wdr = _int_from_amount_like(_get_first(norm_row, ["出金額", "支出", "withdrawal"])) or 0
+            amount = dep - wdr if (dep or wdr) else None
+
+        summary = _get_first(
+            norm_row,
+            ["摘要", "内容", "メモ", "備考", "詳細", "説明", "description", "明細", "用途", "品目", "subject"],
+        ) or ""
+        counterparty = _get_first(
+            norm_row, ["相手先", "支払先", "振込先", "取引先", "payee", "相手方", "店名", "merchant", "名称"]
+        ) or ""
+        debit = _get_first(norm_row, ["借方科目", "借方勘定科目", "debit", "debit_account"]) or ""
+        credit = _get_first(norm_row, ["貸方科目", "貸方勘定科目", "credit", "credit_account"]) or ""
+
+        # Build text blob for rule matching
+        try:
+            values_str = " ".join([str(v) for v in row.values() if v is not None])
+        except Exception:
+            values_str = summary or counterparty
+        text_combined = f"{summary} {counterparty} {values_str}".strip()
+        text_lower = (text_combined or "").lower()
+
+        # Apply rules if accounts missing
+        applied_score = 0
+        if not (debit and credit):
+            for gr in gr_list:
+                try:
+                    if gr.keyword and (gr.keyword.lower() in text_lower):
+                        debit = debit or gr.debit_account
+                        credit = credit or gr.credit_account
+                        break
+                except Exception:
+                    continue
+        for km in km_list:
+            try:
+                if km.keyword and (km.keyword.lower() in text_lower):
+                    if km.debit_account:
+                        debit = km.debit_account
+                    if km.credit_account:
+                        credit = km.credit_account
+                    applied_score += km.weight
+            except Exception:
+                continue
+
+        # Invoice/tax hints from text
+        import re as _re
+        inv_status = None
+        if _re.search(r"T\d{13}", text_combined or ""):
+            inv_status = "適格"
+        else:
+            if _re.search(r"(領収書|請求書|領収|請求)", text_combined or ""):
+                inv_status = "非適格"
+        t_lower = text_lower
+        if any(k in t_lower for k in ("非課税", "不課税", "対象外")):
+            inv_status = "非課税"
+        elif any(k in t_lower for k in ("軽減", "8%", "８％", "8％")):
+            inv_status = "軽減8%"
+        elif any(k in t_lower for k in ("10%", "１０％", "10％")):
+            inv_status = inv_status or "課税10%"
+
+        # Persist
+        doc_name = f"{source_path.name}#row{idx+1}"
+        doc = Document(company_id=company_id, file_path=str(source_path.with_name(doc_name)), ocr_text=text_combined)
+        session.add(doc)
+        session.flush()
+
+        auto = AutoResult(
+            document_id=doc.id,
+            date=date,
+            amount=amount or 0,
+            summary=summary,
+            debit_account=debit,
+            credit_account=credit,
+            counterparty=counterparty,
+            score=applied_score,
+            invoice_status=inv_status,
+        )
+        session.add(auto)
+        imported += 1
+
+    return imported
+
+
+def _run_llm_refine_paginated(session: Session, company_id: int, texts: dict) -> Optional[dict]:
+    """Run LLM refinement page-by-page to avoid prompt size limits and combine results.
+
+    - Splits both PDFテキストとYOMITOKUテキスト into page-level chunks heuristically.
+    - Adds learned KeywordMapping as lightweight hints to each page payload.
+    - Merges the first non-null date, most frequent amount, and majority-vote accounts.
+    """
+    import re as _re
+
+    def _split_pages(s: str) -> list[str]:
+        s = s or ""
+        if "\f" in s:
+            parts = [p.strip() for p in s.split("\f") if p.strip()]
+            if parts:
+                return parts
+        # YOMITOKU: often markdown with headings like '## Page 1'
+        pages = _re.split(r"\n\s*#{1,3}\s*Page\s*\d+.*\n", s)
+        pages = [p.strip() for p in pages if p and p.strip()]
+        if len(pages) > 1:
+            return pages
+        # Fallback: chunk by ~4000 chars
+        chunk = 4000
+        out: list[str] = []
+        i = 0
+        while i < len(s):
+            out.append(s[i : i + chunk])
+            i += chunk
+        return [p.strip() for p in out if p.strip()]
+
+    # PDF embedded text disabled; rely on YOMITOKU only
+    pdf_all = ""
+    yomi_all = (texts.get("text_yomitoku") or "").strip()
+
+    pdf_pages = _split_pages(pdf_all)
+    yomi_pages = _split_pages(yomi_all)
+    # Align by index; if lengths differ, use closest available
+    max_n = max(len(pdf_pages) or 1, len(yomi_pages) or 1)
+
+    # Build hint lines from learned mappings
+    hints_lines: list[str] = []
+    try:
+        for km in session.scalars(select(KeywordMapping).where(KeywordMapping.company_id == company_id)):
+            if not km.keyword:
+                continue
+            hints_lines.append(
+                f"- keyword='{km.keyword}' -> debit='{km.debit_account}' credit='{km.credit_account}' weight={km.weight}"
+            )
+    except Exception:
+        pass
+    hint_block = ("\n\n[学習ヒント]\n" + "\n".join(hints_lines)) if hints_lines else ""
+
+    votes_amount: dict[int, int] = {}
+    votes_debit: dict[str, int] = {}
+    votes_credit: dict[str, int] = {}
+    chosen_date: Optional[str] = None
+    chosen_summary: Optional[str] = None
+
+    for i in range(max_n):
+        p_pdf = pdf_pages[i] if i < len(pdf_pages) else (pdf_pages[-1] if pdf_pages else "")
+        p_yomi = yomi_pages[i] if i < len(yomi_pages) else (yomi_pages[-1] if yomi_pages else "")
+        aug_yomi = (p_yomi + hint_block).strip()
+        try:
+            # Use YOMITOKU-only refinement
+            r = refine_extraction_with_yomi("", aug_yomi, "")
+        except Exception:
+            r = None
+        if not r:
+            continue
+        if not chosen_date and r.get("date"):
+            chosen_date = r.get("date")
+        if not chosen_summary and r.get("summary"):
+            chosen_summary = r.get("summary")
+        amt = r.get("amount")
+        if isinstance(amt, int):
+            votes_amount[amt] = votes_amount.get(amt, 0) + 1
+        d = (r.get("debit_account") or "").strip()
+        if d:
+            votes_debit[d] = votes_debit.get(d, 0) + 1
+        c = (r.get("credit_account") or "").strip()
+        if c:
+            votes_credit[c] = votes_credit.get(c, 0) + 1
+
+    def _winner(dct: dict) -> Optional[Any]:
+        return max(dct.items(), key=lambda kv: kv[1])[0] if dct else None
+
+    if not (chosen_date or votes_amount or votes_debit or votes_credit or chosen_summary):
+        return None
+    return {
+        "date": chosen_date,
+        "amount": _winner(votes_amount),
+        "summary": chosen_summary,
+        "debit_account": _winner(votes_debit) or "",
+        "credit_account": _winner(votes_credit) or "",
+    }
+
+
 def mark_check_later(session: Session, document_id: int) -> None:
     doc = session.get(Document, document_id)
     if not doc:
@@ -271,6 +577,193 @@ def delete_document(session: Session, document_id: int) -> None:
         return
     session.delete(doc)
 
+
+def _extract_tax_breakdown(text: str) -> list[dict]:
+    """Extract 10%/8% tax-rate breakdown from YOMITOKU OCR text.
+
+    Returns a list of dicts like {"rate": 10|8, "net": int|None, "tax": int|None, "gross": int|None}.
+    Best-effort heuristics: looks for lines mentioning 10%/8% (軽減) and nearby
+    lines with keywords like 対象/小計/金額 (net), 消費税/税額 (tax), 合計 (gross).
+    """
+    try:
+        import re as _re
+
+        def _to_half(s: str) -> str:
+            tbl = str.maketrans({
+                "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+                "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+                "％": "%", "，": ",", "．": ".",
+            })
+            return s.translate(tbl)
+
+        def _nums_in(line: str) -> list[int]:
+            line = _to_half(line)
+            line = _re.sub(r"(?<=\d)\s+(?=\d)", "", line)
+            out: list[int] = []
+            for m in _re.finditer(r"([0-9]{1,3}(?:[,\s][0-9]{3})+|[0-9]+)", line):
+                n = int(m.group(1).replace(",", "").replace(" ", ""))
+                if n > 0:
+                    out.append(n)
+            return out
+
+        def _rate_tag(s: str) -> int | None:
+            ss = _to_half(s)
+            low = ss.lower()
+            is10 = ("10%" in low) or ("標準" in low)
+            is8 = ("8%" in low) or ("軽減" in low)
+            if is10 and not is8:
+                return 10
+            if is8 and not is10:
+                return 8
+            # ambiguous: return None
+            return None
+
+        lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+        found: dict[int, dict] = {}
+        i = 0
+        while i < len(lines):
+            rate = _rate_tag(lines[i])
+            if rate is None:
+                i += 1
+                continue
+            rec = found.setdefault(rate, {"rate": rate, "net": None, "tax": None, "gross": None})
+            # look ahead up to 2 lines for amounts with keywords
+            for k in range(0, 3):
+                if i + k >= len(lines):
+                    break
+                ln = lines[i + k]
+                # stop if a different rate block clearly starts
+                other = _rate_tag(ln)
+                if other is not None and other != rate and k > 0:
+                    break
+                nums = _nums_in(ln)
+                if not nums:
+                    continue
+                n = nums[-1]  # prefer the last number on the line
+                low = _to_half(ln).lower()
+                if ("税" in low) or ("消費税" in low):
+                    rec["tax"] = rec["tax"] or n
+                elif ("合計" in low) or ("計" in low and "明細" not in low):
+                    rec["gross"] = rec["gross"] or n
+                elif any(k in low for k in ("対象", "小計", "金額", "売上", "仕入")):
+                    rec["net"] = rec["net"] or n
+            i += 1
+
+        # compute missing values
+        out: list[dict] = []
+        for rate, rec in sorted(found.items()):
+            net, tax, gross = rec.get("net"), rec.get("tax"), rec.get("gross")
+            try:
+                if net is not None and tax is not None and gross is None:
+                    gross = net + tax
+                elif gross is not None and tax is not None and net is None:
+                    net = max(gross - tax, 0)
+                elif gross is not None and net is not None and tax is None:
+                    tax = max(gross - net, 0)
+            except Exception:
+                pass
+            if any(v is not None for v in (net, tax, gross)):
+                out.append({"rate": rate, "net": net, "tax": tax, "gross": gross})
+        return out
+    except Exception:
+        return []
+
+
+def _build_entries_for_document(doc: Document) -> list[JournalEntry]:
+    """Create one or more JournalEntry rows for a document.
+
+    - If 10%/8% breakdown is detected, emit one row per rate with tax_category/tax_amount set on the debit side.
+    - Otherwise, emit a single row with no tax fields.
+    """
+    entries: list[JournalEntry] = []
+    ar = doc.auto_result
+    if not ar:
+        return entries
+
+    from datetime import datetime as _dt
+
+    def _tax_cat(rate: int) -> str:
+        return "課税仕入8%(軽)" if rate == 8 else "課税仕入10%"
+
+    parts = _extract_tax_breakdown(doc.ocr_text or "")
+    if parts:
+        total = len(parts)
+        for idx, p in enumerate(parts):
+            try:
+                rate = int(p.get("rate") or 0)
+            except Exception:
+                rate = 0
+            net = p.get("net")
+            tax = p.get("tax") or 0
+            if not net:
+                # as a fallback, prefer gross if available
+                gross = p.get("gross")
+                if gross is None:
+                    continue
+                net = max(int(gross) - int(tax or 0), 0)
+            amount_base = abs(int(net))
+            tax_amt = abs(int(tax or 0))
+            # 識別フラグ: 複数行のときは 2110/2100/2101 を付与
+            if total <= 1:
+                ident = "2111"
+            elif idx == 0:
+                ident = "2110"
+            elif idx == total - 1:
+                ident = "2101"
+            else:
+                ident = "2100"
+            entry = JournalEntry(
+                identifier_flag=ident,
+                voucher_number="",
+                transaction_date=ar.date or _dt.now().strftime("%Y/%m/%d"),
+                debit=AccountSide(
+                    account=ar.debit_account or "",
+                    amount=amount_base,
+                    # 税区分(H) 必須: 請求書区分が「適格」なら内税表記
+                    tax_category=(
+                        ("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%")
+                        if rate in (8, 10)
+                        else ("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%")
+                    ),
+                    tax_amount=tax_amt,
+                ),
+                credit=AccountSide(
+                    account=ar.credit_account or "",
+                    amount=amount_base,
+                    tax_category=(("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%") if rate in (8, 10) else ("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%")),
+                    tax_amount=0,
+                ),
+                summary=(ar.summary or "")[:64],
+                reference_number="",
+                memo="",
+            )
+            entries.append(entry)
+
+    if not entries:
+        # Fallback: single-line entry without tax fields
+        entry = JournalEntry(
+            identifier_flag="2111",
+            voucher_number="",
+            transaction_date=ar.date or _dt.now().strftime("%Y/%m/%d"),
+            debit=AccountSide(
+                account=ar.debit_account or "",
+                amount=abs(ar.amount or 0),
+                tax_category=("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%"),
+                tax_amount=0,
+            ),
+            credit=AccountSide(
+                account=ar.credit_account or "",
+                amount=abs(ar.amount or 0),
+                tax_category=("課対仕入内10%適格" if getattr(ar, "invoice_status", None) == "適格" else "課対仕入10%"),
+                tax_amount=0,
+            ),
+            summary=(ar.summary or "")[:64],
+            reference_number="",
+            memo="",
+        )
+        entries.append(entry)
+
+    return entries
 
 def confirm_document(
     session: Session,
@@ -289,6 +782,19 @@ def confirm_document(
         raise ValueError("Document not found")
 
     # Apply corrections to auto result
+    # Be defensive about legacy SQLite schemas that might miss newer columns
+    def _table_has(col: str) -> bool:
+        try:
+            bind = session.get_bind()
+            name = getattr(bind.dialect, "name", "") if bind is not None else ""
+            if name == "sqlite":
+                rows = bind.exec_driver_sql("PRAGMA table_info('auto_results')").all()  # type: ignore[attr-defined]
+                cols = {r[1] for r in rows}
+                return col in cols
+        except Exception:
+            pass
+        # For non-SQLite or on failure, assume column exists (modern schema)
+        return True
     if date is not None:
         doc.auto_result.date = date
     if amount is not None:
@@ -299,11 +805,11 @@ def confirm_document(
         doc.auto_result.debit_account = debit
     if credit is not None:
         doc.auto_result.credit_account = credit
-    if debit_sub is not None:
+    if debit_sub is not None and _table_has("debit_subaccount"):
         doc.auto_result.debit_subaccount = debit_sub or None
-    if credit_sub is not None:
+    if credit_sub is not None and _table_has("credit_subaccount"):
         doc.auto_result.credit_subaccount = credit_sub or None
-    if invoice_status is not None:
+    if invoice_status is not None and _table_has("invoice_status"):
         doc.auto_result.invoice_status = invoice_status or None
 
     doc.status = DocumentStatusEnum.CONFIRMED.value
@@ -363,19 +869,9 @@ def confirm_document(
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     out_path = settings.output_dir / f"{date_for_name}_yayoi.csv"
 
-    entry = JournalEntry(
-        identifier_flag="****",
-        voucher_number="1",
-        transaction_date=doc.auto_result.date or datetime.now().strftime("%Y/%m/%d"),
-        debit=AccountSide(account=doc.auto_result.debit_account, amount=abs(doc.auto_result.amount or 0)),
-        credit=AccountSide(account=doc.auto_result.credit_account, amount=abs(doc.auto_result.amount or 0)),
-        summary=(doc.auto_result.summary or "")[:64],
-        reference_number=str(Path(doc.file_path).stem)[:10],
-        memo=str(Path(doc.file_path).name)[:180],
-    )
-
-    exporter = JournalExporter(entries=[entry])
-    exporter.save(out_path, encoding="utf-8")
+    entries = _build_entries_for_document(doc)
+    exporter = JournalExporter(entries=entries)
+    exporter.save(out_path, encoding="utf-8", bom=True)
 
     # Duplicate and archive stamped PDF copies
     try:
@@ -383,6 +879,155 @@ def confirm_document(
     except Exception:
         # Non-fatal: continue even if archiving fails
         pass
+    return out_path
+
+
+def confirm_document_multi(
+    session: Session,
+    document_id: int,
+    rows: list[dict[str, object]],
+) -> Path:
+    """Confirm a document with multiple journal rows and export a multi-line Yayoi CSV.
+
+    - Updates the document's AutoResult from the first row (for consistency with lists and logs).
+    - Marks the document as CONFIRMED.
+    - Exports all provided rows as individual lines in one CSV.
+    """
+    doc = session.get(Document, document_id)
+    if not doc or not doc.auto_result:
+        raise ValueError("Document not found")
+    if not rows:
+        raise ValueError("No rows provided")
+
+    first = rows[0]
+
+    def _get(d: dict[str, object], k: str) -> str | None:
+        v = d.get(k)
+        return str(v).strip() if isinstance(v, str) else (str(v).strip() if v is not None else None)
+
+    # Update auto_result from the first row
+    try:
+        if first.get("date") is not None:
+            doc.auto_result.date = _get(first, "date")
+        if first.get("amount") is not None:
+            try:
+                doc.auto_result.amount = int(first.get("amount") or 0)
+            except Exception:
+                pass
+        if first.get("summary") is not None:
+            doc.auto_result.summary = _get(first, "summary") or ""
+        if first.get("debit_account") is not None:
+            doc.auto_result.debit_account = _get(first, "debit_account") or ""
+        if first.get("credit_account") is not None:
+            doc.auto_result.credit_account = _get(first, "credit_account") or ""
+    except Exception:
+        pass
+
+    doc.status = DocumentStatusEnum.CONFIRMED.value
+    session.add(doc)
+
+    # Replace existing lines for this document
+    try:
+        from sqlalchemy import delete as _delete
+        session.execute(_delete(AutoResultLine).where(AutoResultLine.document_id == doc.id))
+    except Exception:
+        pass
+
+    # Build entries from rows
+    from datetime import datetime as _dt
+    try:
+        base_date = doc.auto_result.date or _dt.now().strftime("%Y/%m/%d")
+    except Exception:
+        base_date = _dt.now().strftime("%Y/%m/%d")
+
+    entries: list[JournalEntry] = []
+    total_rows = len(rows)
+    for i, r in enumerate(rows):
+        try:
+            dt = _get(r, "date") or base_date
+            debit = _get(r, "debit_account") or ""
+            credit = _get(r, "credit_account") or ""
+            try:
+                amt = abs(int(r.get("amount") or 0))
+            except Exception:
+                amt = abs(int(doc.auto_result.amount or 0))
+            summary = _get(r, "summary") or (doc.auto_result.summary or "")
+            # Persist line
+            try:
+                session.add(
+                    AutoResultLine(
+                        document_id=doc.id,
+                        line_no=i + 1,
+                        date=dt,
+                        amount=amt,
+                        summary=summary,
+                        debit_account=debit,
+                        credit_account=credit,
+                    )
+                )
+            except Exception:
+                pass
+            # 識別フラグ: 1行=2111、複数行は 2110/2100/2101
+            if total_rows <= 1:
+                ident = "2111"
+            elif i == 0:
+                ident = "2110"
+            elif i == total_rows - 1:
+                ident = "2101"
+            else:
+                ident = "2100"
+            entry = JournalEntry(
+                identifier_flag=ident,
+                voucher_number="",
+                transaction_date=dt,
+                debit=AccountSide(
+                    account=debit,
+                    amount=amt,
+                    tax_category=("課対仕入内10%適格" if getattr(doc.auto_result, "invoice_status", None) == "適格" else "課対仕入10%"),
+                    tax_amount=0,
+                ),
+                credit=AccountSide(account=credit, amount=amt),
+                summary=summary[:64],
+                reference_number="",
+                memo="",
+            )
+            entries.append(entry)
+        except Exception:
+            continue
+
+    if not entries:
+        raise ValueError("No valid rows to export")
+
+    # Save multi-line CSV
+    settings = get_settings()
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = settings.output_dir / f"{ts}_yayoi.csv"
+    exporter = JournalExporter(entries=entries)
+    exporter.save(out_path, encoding="utf-8", bom=True)
+
+    # Archive stamped PDF copies (best-effort)
+    try:
+        _archive_stamped_pdf(session, doc)
+    except Exception:
+        pass
+
+    # Record a single correction entry (multi)
+    try:
+        session.add(
+            Correction(
+                document_id=doc.id,
+                action=CorrectionActionEnum.OK.value,
+                corrected_date=doc.auto_result.date,
+                corrected_amount=doc.auto_result.amount,
+                corrected_summary=doc.auto_result.summary,
+                debit_account=doc.auto_result.debit_account,
+                credit_account=doc.auto_result.credit_account,
+            )
+        )
+    except Exception:
+        pass
+
     return out_path
 
 
@@ -410,21 +1055,55 @@ def export_confirmed_csv(
         raise ValueError("No confirmed documents to export")
 
     entries: list[JournalEntry] = []
+    included_ids: list[int] = []
+    from sqlalchemy import select as _select
     for d in docs:
         if not d.auto_result:
             continue
-        ar = d.auto_result
-        entry = JournalEntry(
-            identifier_flag="****",
-            voucher_number="1",
-            transaction_date=ar.date or datetime.now().strftime("%Y/%m/%d"),
-            debit=AccountSide(account=ar.debit_account or "", amount=abs(ar.amount or 0)),
-            credit=AccountSide(account=ar.credit_account or "", amount=abs(ar.amount or 0)),
-            summary=(ar.summary or "")[:64],
-            reference_number=str(Path(d.file_path).stem)[:10],
-            memo=str(Path(d.file_path).name)[:180],
-        )
-        entries.append(entry)
+        # If multi-line entries exist for this document, use them; otherwise fallback
+        try:
+            lines = list(session.scalars(_select(AutoResultLine).where(AutoResultLine.document_id == d.id)))
+        except Exception:
+            lines = []
+        if lines:
+            from datetime import datetime as _dt
+            total = len(lines)
+            for i, ln in enumerate(lines):
+                try:
+                    dt = ln.date or (d.auto_result.date or _dt.now().strftime("%Y/%m/%d"))
+                    amt = abs(int(ln.amount or 0))
+                except Exception:
+                    dt = d.auto_result.date or _dt.now().strftime("%Y/%m/%d")
+                    amt = abs(int(d.auto_result.amount or 0))
+                if total <= 1:
+                    ident = "2111"
+                elif i == 0:
+                    ident = "2110"
+                elif i == total - 1:
+                    ident = "2101"
+                else:
+                    ident = "2100"
+                entries.append(
+                    JournalEntry(
+                        identifier_flag=ident,
+                        voucher_number="",
+                        transaction_date=dt,
+                        debit=AccountSide(
+                            account=(ln.debit_account or d.auto_result.debit_account or ""),
+                            amount=amt,
+                            tax_category=("課対仕入内10%適格" if getattr(d.auto_result, "invoice_status", None) == "適格" else "課対仕入10%"),
+                            tax_amount=0,
+                        ),
+                        credit=AccountSide(account=(ln.credit_account or d.auto_result.credit_account or ""), amount=amt),
+                        summary=((ln.summary or d.auto_result.summary or "")[:64]),
+                        reference_number="",
+                        memo="",
+                    )
+                )
+            included_ids.append(int(d.id))
+        else:
+            entries.extend(_build_entries_for_document(d))
+            included_ids.append(int(d.id))
 
     settings = get_settings()
     target_dir = output_dir or settings.output_dir
@@ -433,6 +1112,32 @@ def export_confirmed_csv(
     out_path = target_dir / f"{ts}_yayoi.csv"
     exporter = JournalExporter(entries=entries)
     exporter.save(out_path, encoding=encoding, bom=bom)
+
+    # Write manifest for this export (to enable later restore)
+    try:
+        import json as _json
+        manifest = {
+            "csv": str(out_path),
+            "exported_at": datetime.now().isoformat(),
+            "company_id": int(company_id),
+            "document_ids": included_ids,
+        }
+        man_path = out_path.with_suffix("").with_name(out_path.stem).with_suffix(".json")
+        # If stem has .csv, replace with .json; above ensures .json alongside
+        with open(man_path, "w", encoding="utf-8") as fh:
+            _json.dump(manifest, fh, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    # Mark exported docs as EXPORTED
+    try:
+        idset = set(included_ids)
+        for d in docs:
+            if int(d.id) in idset:
+                d.status = DocumentStatusEnum.EXPORTED.value
+                session.add(d)
+    except Exception:
+        pass
     return out_path
 
 

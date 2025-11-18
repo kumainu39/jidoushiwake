@@ -18,6 +18,7 @@ def main() -> None:
     with get_session() as s:
         n = import_account_master_from_text(s, text)
         print(f'Imported master accounts: {n}')
+        print('完了しました')
 
 
 if __name__ == '__main__':
