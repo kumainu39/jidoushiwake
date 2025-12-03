@@ -80,26 +80,20 @@ class LLMSettingsPage(QWidget):
         layout = QVBoxLayout()
         form = QFormLayout()
         self.provider = QLineEdit("llama-cpp")
-        self.model_path = QLineEdit()
-        # Device selection: dropdown (cpu/gpu)
-        from PyQt6.QtWidgets import QComboBox
-        self.device = QComboBox()
+        self.model_path = QLineEdit("F:\\models\\Llama-3-ELYZA-JP-8B-q4_k_m.gguf")
+        # GPUのみ前提（変更不可）
+        self.device = QLineEdit("gpu")
         try:
-            self.device.addItems(["cpu", "gpu"])
+            self.device.setReadOnly(True)
         except Exception:
             pass
-        self.n_gpu_layers = QLineEdit("0")
+        self.n_gpu_layers = QLineEdit("-1")
         self.n_threads = QLineEdit("4")
-        self.use_colab = QCheckBox("コラボを使用 (CPU のみ)")
-        self.remote_base_url = QLineEdit()
-        self.remote_base_url.setPlaceholderText("https://xxxx.ngrok-free.dev など")
         form.addRow("Provider", self.provider)
         form.addRow("Model Path (GGUF)", self.model_path)
-        form.addRow("Device (cpu/gpu)", self.device)
+        form.addRow("Device (GPUのみ)", self.device)
         form.addRow("GPU Layers", self.n_gpu_layers)
         form.addRow("Threads", self.n_threads)
-        form.addRow(" ", self.use_colab)
-        form.addRow("Colab URL", self.remote_base_url)
         save = QPushButton("保存")
         save.clicked.connect(self.save)  # type: ignore[arg-type]
         layout.addLayout(form)
@@ -115,22 +109,9 @@ class LLMSettingsPage(QWidget):
                 data = r.json()
                 self.provider.setText(data.get("provider") or "llama-cpp")
                 self.model_path.setText(data.get("model_path") or "")
-                # Ensure device combobox reflects current value
-                dev = data.get("device") or "cpu"
-                try:
-                    if dev not in [self.device.itemText(i) for i in range(self.device.count())]:
-                        self.device.addItem(dev)
-                    self.device.setCurrentText(dev)
-                except Exception:
-                    # Fallback if combobox is not available
-                    try:
-                        self.device.setEditText(dev)  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
-                self.n_gpu_layers.setText(str(data.get("n_gpu_layers") or "0"))
+                self.device.setText("gpu")
+                self.n_gpu_layers.setText(str(data.get("n_gpu_layers") or "-1"))
                 self.n_threads.setText(str(data.get("n_threads") or "4"))
-                self.use_colab.setChecked(bool(data.get("use_colab_remote") or False))
-                self.remote_base_url.setText(data.get("remote_base_url") or "")
         except Exception:
             pass
 
@@ -138,14 +119,10 @@ class LLMSettingsPage(QWidget):
         payload = {
             "provider": self.provider.text().strip() or "llama-cpp",
             "model_path": self.model_path.text().strip() or None,
-            "device": (self.device.currentText().strip() if hasattr(self.device, 'currentText') else 'cpu') or "cpu",
-            "n_gpu_layers": int(self.n_gpu_layers.text()) if self.n_gpu_layers.text().strip() else 0,
+            "device": "gpu",
+            "n_gpu_layers": int(self.n_gpu_layers.text()) if self.n_gpu_layers.text().strip() else -1,
             "n_threads": int(self.n_threads.text()) if self.n_threads.text().strip() else 4,
-            "use_colab_remote": bool(self.use_colab.isChecked()),
-            "remote_base_url": self.remote_base_url.text().strip() or None,
         }
-        if payload.get("use_colab_remote"):
-            payload["device"] = "cpu"
         try:
             r = requests.post(f"{API_URL}/admin/llm_settings", json=payload, timeout=10)
             if r.ok:

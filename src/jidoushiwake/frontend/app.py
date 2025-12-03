@@ -1480,14 +1480,18 @@ class SettingsPage(QWidget):
         nl_group.setLayout(nlg)
         layout.addWidget(nl_group)
 
-        # LLM override settings per company
+        # LLM override settings per company (GPU 前提)
         llm_group = QGroupBox("LLM設定（会社別オーバーライド）")
         lg = QVBoxLayout()
         self.llm_use_override = QLineEdit("0")
         self.llm_provider = QLineEdit("llama-cpp")
-        self.llm_model_path = QLineEdit()
-        self.llm_device = QLineEdit("cpu")
-        self.llm_n_gpu_layers = QLineEdit("0")
+        self.llm_model_path = QLineEdit("F:\\models\\Llama-3-ELYZA-JP-8B-q4_k_m.gguf")
+        self.llm_device = QLineEdit("gpu")
+        try:
+            self.llm_device.setReadOnly(True)
+        except Exception:
+            pass
+        self.llm_n_gpu_layers = QLineEdit("-1")
         self.llm_n_threads = QLineEdit("4")
         self.llm_lora_path = QLineEdit()
         self.llm_prompt_template = QLineEdit()
@@ -1502,9 +1506,6 @@ class SettingsPage(QWidget):
             llm_form.setContentsMargins(8, 8, 8, 8)
         except Exception:
             pass
-        # Colab/remote settings and connectivity test
-        self.llm_use_colab = QLineEdit("0")
-        self.llm_remote_url = QLineEdit("https://nonbeneficent-oversoftly-piper.ngrok-free.dev")
         try:
             for w in (
                 self.llm_use_override,
@@ -1515,8 +1516,6 @@ class SettingsPage(QWidget):
                 self.llm_n_threads,
                 self.llm_lora_path,
                 self.llm_prompt_template,
-                self.llm_use_colab,
-                self.llm_remote_url,
             ):
                 w.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
                 w.setMinimumWidth(280)
@@ -1526,25 +1525,11 @@ class SettingsPage(QWidget):
         llm_form.addRow("Override使用(1/0)", self.llm_use_override)
         llm_form.addRow("Provider", self.llm_provider)
         llm_form.addRow("Model(GGUF)", self.llm_model_path)
-        llm_form.addRow("Device(cpu/gpu)", self.llm_device)
+        llm_form.addRow("Device(GPUのみ)", self.llm_device)
         llm_form.addRow("GPU Layers", self.llm_n_gpu_layers)
         llm_form.addRow("Threads", self.llm_n_threads)
         llm_form.addRow("LoRA Path", self.llm_lora_path)
         llm_form.addRow("Prompt Template", self.llm_prompt_template)
-        llm_form.addRow("Use Colab(1/0)", self.llm_use_colab)
-        _ping_row = QHBoxLayout()
-        _ping_row.addWidget(self.llm_remote_url)
-        _btn_ping = QPushButton("接続テスト")
-        _btn_ping.clicked.connect(self.on_llm_ping)  # type: ignore[arg-type]
-        try:
-            _btn_ping.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            _ping_row.addWidget(_btn_ping)
-            _ping_row.setStretch(0, 1)
-            _ping_row.setStretch(1, 0)
-        except Exception:
-            _ping_row.addWidget(_btn_ping)
-        _ping_container = QWidget(); _ping_container.setLayout(_ping_row)
-        llm_form.addRow("Remote URL", _ping_container)
         llm_save = QPushButton("LLM設定を保存")
         llm_save.clicked.connect(self.on_save_llm)  # type: ignore[arg-type]
         lg.addLayout(llm_form)
@@ -1659,8 +1644,8 @@ class SettingsPage(QWidget):
                 self.llm_use_override.setText("1" if data.get("use_override") else "0")
                 self.llm_provider.setText(data.get("provider") or "llama-cpp")
                 self.llm_model_path.setText(data.get("model_path") or "")
-                self.llm_device.setText(data.get("device") or "cpu")
-                self.llm_n_gpu_layers.setText(str(data.get("n_gpu_layers") or "0"))
+                self.llm_device.setText("gpu")
+                self.llm_n_gpu_layers.setText(str(data.get("n_gpu_layers") or "-1"))
                 self.llm_n_threads.setText(str(data.get("n_threads") or "4"))
                 self.llm_lora_path.setText(data.get("lora_path") or "")
                 self.llm_prompt_template.setText(data.get("prompt_template") or "")
@@ -1674,13 +1659,11 @@ class SettingsPage(QWidget):
                 "use_override": self.llm_use_override.text().strip() == "1",
                 "provider": self.llm_provider.text().strip() or "llama-cpp",
                 "model_path": self.llm_model_path.text().strip() or None,
-                "device": self.llm_device.text().strip() or "cpu",
-                "n_gpu_layers": int(self.llm_n_gpu_layers.text()) if self.llm_n_gpu_layers.text().strip() else 0,
+                "device": "gpu",
+                "n_gpu_layers": int(self.llm_n_gpu_layers.text()) if self.llm_n_gpu_layers.text().strip() else -1,
                 "n_threads": int(self.llm_n_threads.text()) if self.llm_n_threads.text().strip() else 4,
                 "lora_path": self.llm_lora_path.text().strip() or None,
                 "prompt_template": self.llm_prompt_template.text().strip() or None,
-                "use_colab": (self.llm_use_colab.text().strip() == "1"),
-                "remote_base_url": (self.llm_remote_url.text().strip() or None),
             }
             r = requests.post(f"{API_URL}/company_llm_settings", json=payload, timeout=10)
             if r.ok:
@@ -1689,24 +1672,6 @@ class SettingsPage(QWidget):
                 QMessageBox.warning(self, "保存失敗", r.text)
         except Exception as e:
             QMessageBox.warning(self, "保存失敗", str(e))
-    def on_llm_ping(self) -> None:
-        url = (
-            (self.llm_remote_url.text() or "").strip()
-            or "https://nonbeneficent-oversoftly-piper.ngrok-free.dev"
-        )
-        try:
-            r = requests.post(f"{API_URL}/admin/llm_ping", json={"url": url}, timeout=5)
-            if not r.ok:
-                QMessageBox.warning(self, "接続テスト", f"失敗: {r.status_code} {r.text}")
-                return
-            data = r.json() or {}
-            if data.get("ok"):
-                ms = data.get("elapsed_ms")
-                QMessageBox.information(self, "接続テスト", f"接続成功: {data.get('url')} ({ms} ms)")
-            else:
-                QMessageBox.warning(self, "接続テスト", f"接続失敗: {data.get('url')}\n{data.get('detail') or ''}")
-        except Exception as e:
-            QMessageBox.warning(self, "接続テスト", f"エラー: {e}")
     def load_llm_logs(self) -> None:
         try:
             r = requests.get(f"{API_URL}/company_llm_logs", params={"company_name": self.company, "limit": 50}, timeout=10)
@@ -1849,9 +1814,13 @@ class OutputPage(QWidget):
             self.dest_edit.setText(d)
 
     def _history_dir(self) -> Path:
-        p = Path(self.dest_edit.text().strip())
-        if p.exists() and p.is_dir():
-            return p
+        try:
+            p = Path(self.dest_edit.text().strip())
+            if p.exists() and p.is_dir():
+                return p
+        except Exception:
+            # Ignore inaccessible network paths and fall back to local output
+            pass
         base = Path(__file__).resolve().parents[3]
         return base / "output"
 

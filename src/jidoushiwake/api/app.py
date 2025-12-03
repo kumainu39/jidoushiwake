@@ -604,12 +604,10 @@ def api_nl_global_rule(payload: NLRuleIn):
 # Admin: LLM settings (stored simply in-memory/env-like via settings table placeholder)
 class LLMSettings(BaseModel):
     provider: str = "llama-cpp"
-    model_path: Optional[str] = None  # GGUF file path
-    device: str = "cpu"  # cpu or gpu
-    n_gpu_layers: int = 0
+    model_path: Optional[str] = "F:\\models\\Llama-3-ELYZA-JP-8B-q4_k_m.gguf"  # GGUF file path
+    device: str = "gpu"  # GPUのみ
+    n_gpu_layers: int = -1
     n_threads: int = 4
-    use_colab_remote: bool = False
-    remote_base_url: Optional[str] = None
 
 
 _LLM_SETTINGS: LLMSettings = LLMSettings()
@@ -624,15 +622,14 @@ def api_get_llm_settings():
 def api_set_llm_settings(payload: LLMSettings):
     global _LLM_SETTINGS
     _LLM_SETTINGS = payload
+    _LLM_SETTINGS.device = "gpu"
     # Apply to runtime LLM client
     cfg = LLMConfig(
         provider=_LLM_SETTINGS.provider,
         model_path=_LLM_SETTINGS.model_path,
-        device=_LLM_SETTINGS.device,
+        device="gpu",
         n_gpu_layers=_LLM_SETTINGS.n_gpu_layers,
         n_threads=_LLM_SETTINGS.n_threads,
-        use_colab_remote=_LLM_SETTINGS.use_colab_remote,
-        remote_base_url=_LLM_SETTINGS.remote_base_url or LLMConfig().remote_base_url,
     )
     set_llm_config(cfg)
     return _LLM_SETTINGS
@@ -647,13 +644,11 @@ class CompanyLLMSettingsIn(BaseModel):
     use_override: bool = False
     provider: str = "llama-cpp"
     model_path: Optional[str] = None
-    device: str = "cpu"
-    n_gpu_layers: int = 0
+    device: str = "gpu"
+    n_gpu_layers: int = -1
     n_threads: int = 4
     lora_path: Optional[str] = None
     prompt_template: Optional[str] = None
-    use_colab: bool = False
-    remote_base_url: Optional[str] = None
 
 
 class CompanyLLMSettingsOut(BaseModel):
@@ -665,8 +660,6 @@ class CompanyLLMSettingsOut(BaseModel):
     n_threads: int
     lora_path: Optional[str]
     prompt_template: Optional[str]
-    use_colab: bool
-    remote_base_url: Optional[str]
 
 
 @app.get("/company_llm_settings", response_model=CompanyLLMSettingsOut)
@@ -678,17 +671,23 @@ def api_get_company_llm_settings(company_name: str):
             cs = CompanyLLMSetting(company_id=company.id)
             s.add(cs)
             s.flush()
+        # Enforce GPU-only setting
+        try:
+            if cs.device != "gpu":
+                cs.device = "gpu"
+            if cs.n_gpu_layers == 0:
+                cs.n_gpu_layers = -1
+        except Exception:
+            pass
         return CompanyLLMSettingsOut(
             use_override=bool(cs.use_override),
             provider=cs.provider,
             model_path=cs.model_path,
-            device=cs.device,
+            device="gpu",
             n_gpu_layers=cs.n_gpu_layers,
             n_threads=cs.n_threads,
             lora_path=cs.lora_path,
             prompt_template=cs.prompt_template,
-            use_colab=bool(getattr(cs, "use_colab", 0)),
-            remote_base_url=getattr(cs, "remote_base_url", None),
         )
 
 
@@ -703,37 +702,31 @@ def api_set_company_llm_settings(payload: CompanyLLMSettingsIn):
         cs.use_override = 1 if payload.use_override else 0
         cs.provider = payload.provider
         cs.model_path = payload.model_path
-        cs.device = payload.device
+        cs.device = "gpu"
         cs.n_gpu_layers = payload.n_gpu_layers
         cs.n_threads = payload.n_threads
         cs.lora_path = payload.lora_path
         cs.prompt_template = payload.prompt_template
-        cs.use_colab = 1 if payload.use_colab else 0
-        cs.remote_base_url = payload.remote_base_url
         s.flush()
         return CompanyLLMSettingsOut(
             use_override=bool(cs.use_override),
             provider=cs.provider,
             model_path=cs.model_path,
-            device=cs.device,
+            device="gpu",
             n_gpu_layers=cs.n_gpu_layers,
             n_threads=cs.n_threads,
             lora_path=cs.lora_path,
             prompt_template=cs.prompt_template,
-            use_colab=bool(getattr(cs, "use_colab", 0)),
-            remote_base_url=getattr(cs, "remote_base_url", None),
         )
 
 
-# Admin: LLM connectivity ping (Colab/remote endpoint)
+# Admin: LLM connectivity ping (local GPU readiness)
 class LLMPingIn(BaseModel):
-    url: Optional[str] = None
     timeout: Optional[float] = None
 
 
 class LLMPingOut(BaseModel):
     ok: bool
-    url: str
     elapsed_ms: Optional[int] = None
     detail: Optional[str] = None
 
@@ -743,12 +736,6 @@ def api_llm_ping(payload: LLMPingIn):
     import time as _time
     from ..llm_client import LLMConfig as _LLMConfig, temporary_config as _temp_cfg, available as _llm_available
 
-    base = (
-        payload.url
-        or _LLM_SETTINGS.remote_base_url
-        or _LLMConfig().remote_base_url
-        or "https://nonbeneficent-oversoftly-piper.ngrok-free.dev"
-    ).strip()
     t0 = _time.perf_counter()
     ok = False
     detail = None
@@ -756,11 +743,9 @@ def api_llm_ping(payload: LLMPingIn):
         cfg = _LLMConfig(
             provider=_LLM_SETTINGS.provider,
             model_path=_LLM_SETTINGS.model_path,
-            device="cpu",
-            n_gpu_layers=0,
+            device="gpu",
+            n_gpu_layers=_LLM_SETTINGS.n_gpu_layers,
             n_threads=max(1, int(_LLM_SETTINGS.n_threads or 4)),
-            use_colab_remote=True,
-            remote_base_url=base,
         )
         with _temp_cfg(cfg):
             ok = bool(_llm_available())
@@ -768,7 +753,7 @@ def api_llm_ping(payload: LLMPingIn):
         ok = False
         detail = str(e)
     elapsed = int(((_time.perf_counter() - t0) * 1000))
-    return LLMPingOut(ok=ok, url=base, elapsed_ms=elapsed, detail=detail)
+    return LLMPingOut(ok=ok, elapsed_ms=elapsed, detail=detail)
 
 
 class CompanyLLMLogOut(BaseModel):

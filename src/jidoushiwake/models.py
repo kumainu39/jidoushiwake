@@ -184,7 +184,7 @@ class CompanyLLMSetting(Base):
     use_override: Mapped[bool] = mapped_column(Integer, default=0)  # 0=False, 1=True
     provider: Mapped[str] = mapped_column(String(32), default="llama-cpp")
     model_path: Mapped[Optional[str]] = mapped_column(Text, default=None)
-    device: Mapped[str] = mapped_column(String(8), default="cpu")  # cpu/gpu
+    device: Mapped[str] = mapped_column(String(8), default="gpu")  # GPU only
     n_gpu_layers: Mapped[int] = mapped_column(Integer, default=0)
     n_threads: Mapped[int] = mapped_column(Integer, default=4)
     lora_path: Mapped[Optional[str]] = mapped_column(Text, default=None)

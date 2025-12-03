@@ -20,7 +20,7 @@ pymupdf>=1.23,<2
 Pillow>=10,<12
 opencv-python-headless>=4.9,<5
 paddleocr>=2.7
-llama-cpp-python>=0.2.90
+llama-cpp-python==0.3.16
 reportlab>=4.0,<5
 
 # Database driver (PostgreSQL, production). On Windows/PoC, binary wheel is fine.
@@ -33,3 +33,9 @@ pyinstaller>=6,<7
 yomitoku
 
 openpyxl
+
+# GPU: CUDA-enabled PyTorch (installable on Python <3.13; GPU build).
+# Extra index for CUDA wheels (PyTorch) and llama-cpp CUDA wheels
+--extra-index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+torch==2.5.1+cu121 ; python_version < "3.13"
