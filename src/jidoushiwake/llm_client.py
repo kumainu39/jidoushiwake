@@ -9,15 +9,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 LOGGER = logging.getLogger(__name__)
 
+# Fixed model path (GPU llama.cpp only)
+DEFAULT_MODEL_PATH = Path(r"F:\models\Llama-3-ELYZA-JP-8B-q4_k_m.gguf")
+
 
 @dataclass
 class LLMConfig:
     provider: str = "llama-cpp"
-    model_path: Optional[str] = "F:\\models\\Llama-3-ELYZA-JP-8B-q4_k_m.gguf"  # path to GGUF
+    model_path: Optional[str] = str(DEFAULT_MODEL_PATH)  # path to GGUF
     device: str = "gpu"  # GPU is required; CPU fallback is not supported
     n_gpu_layers: int = -1  # -1 = auto/full offload
     n_threads: int = 4  # kept for llama.cpp compatibility
-    context_length: int = 4096
+    context_length: int = 8192
     lora_path: Optional[str] = None
     prompt_template: Optional[str] = None
 
@@ -28,6 +31,11 @@ _CFG = LLMConfig()
 
 def set_config(cfg: LLMConfig) -> None:
     global _CFG, _LLM
+    # Force GPU llama.cpp with fixed model path; ignore CPU/other providers during tests
+    cfg.provider = "llama-cpp"
+    cfg.device = "gpu"
+    if not cfg.model_path:
+        cfg.model_path = str(DEFAULT_MODEL_PATH)
     _CFG = cfg
     _LLM = None  # force reload with new settings
 
@@ -62,15 +70,18 @@ def _load_llama() -> Any | None:
     global _LLM
     if _LLM is not None:
         return _LLM
-    if _CFG.provider != "llama-cpp" or not _CFG.model_path:
+    # Always use local llama.cpp GGUF; no CPU fallback
+    if _CFG.provider != "llama-cpp":
+        LOGGER.error("Only llama-cpp GPU provider is supported in this build.")
+    model_path = Path(_CFG.model_path or DEFAULT_MODEL_PATH)
+    if not model_path:
+        LOGGER.error("LLM model path is not set.")
         return None
     if not _gpu_available():
         LOGGER.error("GPU device is required but not available.")
         return None
     try:
         from llama_cpp import Llama  # type: ignore
-
-        model_path = Path(_CFG.model_path)
         if not model_path.exists():
             LOGGER.error("LLM model path does not exist: %s", model_path)
             return None
@@ -196,15 +207,15 @@ def _complete(prompt: str, max_tokens: int, temperature: float, stop: Optional[L
 def refine_extraction(text_pdf: str, text_paddle: str) -> Optional[Dict[str, Any]]:
     """Use the local GPU LLM to refine field extraction. Returns dict or None."""
     base_prompt = (
-        "以下�E領収書・請求書などの日本語OCRチE��ストです、En"
-        "2種類�EOCR結果�E�EDF埋め込み層、画像OCR�E�を渡します、En"
-        "取引�E基本頁E���E�日仁EYYYY/MM/DD)、E��顁E整数)、摘要E4斁E��以丁E、借方勘定科目、貸方勘定科目 を推定し、\n"
-        "信頼度(0、E)を含めてJSONで返してください、En"
+        "以下は領収書・請求書などの日本語OCRテキストです。\n"
+        "2種類のOCR結果（PDF埋め込みテキスト、画像OCR=PaddleOCR）を渡します。\n"
+        "取引の基本項目（日付YYYY/MM/DD、金額=整数）、摘要（4〜30文字程度）、借方勘定科目、貸方勘定科目を推定し、\n"
+        "信頼度(0-1)を含めてJSONで返してください。\n"
         "出力キー: date, amount, summary, debit_account, credit_account, confidence\n"
-        "金額�E数値のみ。日付�EYYYY/MM/DD。未知はnull、En"
-        "[PDF埋め込みチE��スチE\n" + (text_pdf or "") + "\n\n"
+        "金額は数値のみ。日付はYYYY/MM/DD。未知はnull。\n"
+        "[PDF埋め込みテキスト]\n" + (text_pdf or "") + "\n\n"
         "[画像OCR(PaddleOCR)]\n" + (text_paddle or "") + "\n\n"
-        "JSONだけを出力してください、E"
+        "JSONだけを出力してください。余計な説明は不要です。"
     )
     prompt = _apply_template(base_prompt)
 
@@ -228,21 +239,21 @@ def refine_extraction(text_pdf: str, text_paddle: str) -> Optional[Dict[str, Any
 def refine_extraction_with_yomi(text_pdf: str, text_yomitoku: str = "", text_paddle: str = "") -> Optional[Dict[str, Any]]:
     """Refine field extraction using up to three sources: PDF text, YOMITOKU, and image OCR."""
     sections: list[str] = []
-    sections.append("[PDF埋め込みチE��スチE\n" + (text_pdf or ""))
+    sections.append("[PDF埋め込みテキスト]\n" + (text_pdf or ""))
     if (text_yomitoku or "").strip():
-        sections.append("[YOMITOKU(マ�Eクダウン結合)]\n" + (text_yomitoku or ""))
+        sections.append("[YOMITOKU(マークダウン結合)]\n" + (text_yomitoku or ""))
     if (text_paddle or "").strip():
         sections.append("[画像OCR(PaddleOCR)]\n" + (text_paddle or ""))
 
     base_prompt = (
-        "以下�E領収書・請求書などの日本語OCRチE��ストです、En"
-        "最大3種類�E結果�E�EDF埋め込み層、YOMITOKU、画像OCR�E�を渡します、En"
-        "取引�E基本頁E���E�日仁EYYYY/MM/DD)、E��顁E整数)、摘要E4斁E��以丁E、借方勘定科目、貸方勘定科目 を推定し、\n"
-        "信頼度(0、E)を含めてJSONで返してください、En"
+        "以下は領収書・請求書などの日本語OCRテキストです。\n"
+        "最大3種類の結果（PDF埋め込みテキスト、YOMITOKU、画像OCR=PaddleOCR）を渡します。\n"
+        "取引の基本項目（日付YYYY/MM/DD、金額=整数）、摘要（4〜30文字程度）、借方勘定科目、貸方勘定科目を推定し、\n"
+        "信頼度(0-1)を含めてJSONで返してください。\n"
         "出力キー: date, amount, summary, debit_account, credit_account, confidence\n"
-        "金額�E数値のみ。日付�EYYYY/MM/DD。未知はnull、En"
+        "金額は数値のみ。日付はYYYY/MM/DD。未知はnull。\n"
         + "\n\n".join(sections)
-        + "\n\nJSONだけを出力してください。余計な説明�E不要です、E"
+        + "\n\nJSONだけを出力してください。余計な説明は不要です。"
     )
     prompt = _apply_template(base_prompt)
 
@@ -273,12 +284,12 @@ def parse_nl_rule(instruction: str) -> Optional[Dict[str, Any]]:
     text = None
     try:
         base_prompt = (
-            "以下�E自然言語�E持E��から、仕訳の初期設定ルールを抽出し、JSONで返してください、En"
-            "忁E��キー: keyword, debit_account, credit_account。任意キー: priority(整数), enabled(真偽)、En"
-            "キーワード�EOCRチE��ストに含まれる想定�E識別語。借方/貸方は勘定科目名、En"
-            "優先度の既定�E0、enabledの既定�Etrue、En"
-            "出力�EJSONのみ。余計な説明�E不要です、En"
-            f"持E��: {instr}\n"
+            "以下の自然言語の指示から、仕訳の初期設定ルールを抽出し、JSONで返してください。\n"
+            "必須キー: keyword, debit_account, credit_account。任意キー: priority(整数), enabled(真偽)\n"
+            "キーワードはOCRテキストに含まれる想定の識別語。借方/貸方は勘定科目名。\n"
+            "優先度の既定は0、enabledの既定はtrue。\n"
+            "出力はJSONのみ。余計な説明は不要です。\n"
+            f"指示: {instr}\n"
         )
         prompt = _apply_template(base_prompt)
         text = _complete(prompt, max_tokens=200, temperature=0.1, stop=["\n\n"])

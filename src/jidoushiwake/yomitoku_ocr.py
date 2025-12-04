@@ -117,7 +117,7 @@ def extract_text_with_yomitoku(
 
     - When `ensure=True`, raise RuntimeError if YOMITOKU cannot be used or returns empty text.
     - `output_dir` controls where CLI output files are written (defaults to `<pdf_dir>/yomitoku_output` or env `YOMITOKU_OUTPUT_DIR`).
-    - `fmt` overrides output format (defaults to env `YOMITOKU_FORMAT` or `md`).
+    - `fmt` overrides output format (defaults to env `YOMITOKU_FORMAT` or `json`).
     """
 
     # Prepare per-run log file in logs dir
@@ -206,7 +206,7 @@ def extract_text_with_yomitoku(
                 except Exception:
                     run_out = base_out / "run"
                 run_out.mkdir(parents=True, exist_ok=True)
-                fmt_val = fmt or os.getenv("YOMITOKU_FORMAT", "md")
+                fmt_val = fmt or os.getenv("YOMITOKU_FORMAT", "json")
 
                 # Workaround: Some environments fail with non-ASCII filenames. Copy to temp with ASCII name.
                 pdf_for_cli = pdf_path
@@ -285,9 +285,9 @@ def extract_text_with_yomitoku(
                 collected: list[str] = []
                 # Prefer typical combined file names first
                 preferred = [
+                    "combined.json",
                     "combined.md",
                     "combined.txt",
-                    "combined.json",
                 ]
                 for name in preferred:
                     f = run_out / name
@@ -355,7 +355,7 @@ def _collect_dir_files(directory: Path, pattern: str = "*") -> List[Path]:
 def process_pdf(
     pdf_path: str | os.PathLike[str],
     *,
-    output_format: str = "md",
+    output_format: str = "json",
     combine: bool = True,
     encoding: str = "utf-8",
     output_dir: str | os.PathLike[str] | None = None,
