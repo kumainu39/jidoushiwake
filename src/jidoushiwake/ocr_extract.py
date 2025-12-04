@@ -135,6 +135,36 @@ def extract_text_both(pdf_path: Path) -> dict:
         LOGGER.warning("[OCR] YOMITOKU failed: %s", e)
         t_yomi = ""
     LOGGER.info("[OCR] YOMITOKU extracted: %d chars", len(t_yomi or ""))
+    # If YOMITOKU output is JSON, flatten to text for downstream heuristics/LLM
+    try:
+        import json as _json
+
+        _t = (t_yomi or "").strip()
+        if _t.startswith("{") or _t.startswith("["):
+            def _flatten(obj) -> list[str]:
+                out: list[str] = []
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        v_txt = _flatten(v)
+                        if v_txt:
+                            out.append(f"{k}: " + " / ".join(v_txt))
+                elif isinstance(obj, (list, tuple)):
+                    for v in obj:
+                        out.extend(_flatten(v))
+                else:
+                    s = str(obj).strip()
+                    if s:
+                        out.append(s)
+                return out
+
+            parsed = _json.loads(_t)
+            flat_lines = _flatten(parsed)
+            t_yomi_flat = "\n".join(flat_lines)
+            if t_yomi_flat:
+                LOGGER.info("[OCR] YOMITOKU JSON flattened for LLM/rules: %d -> %d chars", len(_t), len(t_yomi_flat))
+                t_yomi = t_yomi_flat
+    except Exception:
+        pass
 
     # 2) If YOMITOKU empty, try PaddleOCR
     if not (t_yomi and t_yomi.strip()):
