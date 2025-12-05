@@ -2141,6 +2141,8 @@ class ReviewPage(QWidget):
     def __init__(self, company: str) -> None:
         super().__init__()
         self.company = company
+        # In-memory draft edits per document to keep unsaved changes when paging.
+        self._draft_edits: dict[int, list[dict]] = {}
         layout = QHBoxLayout()
 
         # Left: PDF preview + NL instruction
@@ -2619,6 +2621,8 @@ class ReviewPage(QWidget):
     # Journal-style grid helpers (per-PDF rendering)
     # -----------------------
     def _load_unconfirmed(self) -> None:
+        # Cache current page edits before reloading list
+        self._cache_current_doc_edits()
         try:
             self._loading = True
             # fetch account maps once
@@ -2634,6 +2638,12 @@ class ReviewPage(QWidget):
                 self._render_current_doc()
                 return
             self._docs = list(r.json() or [])
+            # Drop draft caches for docs that no longer exist
+            try:
+                ids = {int(d.get("id")) for d in self._docs}
+                self._draft_edits = {k: v for k, v in self._draft_edits.items() if k in ids}
+            except Exception:
+                pass
             # Keep current index if possible; otherwise clamp
             curr = getattr(self, "_doc_index", 0)
             if not self._docs:
@@ -2669,6 +2679,7 @@ class ReviewPage(QWidget):
 
         d = self._docs[idx]
         auto = d.get("auto") or {}
+        doc_id = int(d.get("id"))
         date = auto.get("date") or ""
         amount = abs(auto.get("amount") or 0)
         debit = auto.get("debit_account") or ""
@@ -2678,41 +2689,43 @@ class ReviewPage(QWidget):
         summary = auto.get("summary") or ""
         tax = auto.get("invoice_status") or ""
 
-        # Set up a 2-row table for this single PDF's entry
-        self.table.setRowCount(2)
-        self._row_to_id = [int(d.get("id")), int(d.get("id"))]
+        # If there are cached edits for this doc, re-apply them instead of the server values
+        if not self._apply_cached_entries(doc_id):
+            # Set up a 2-row table for this single PDF's entry
+            self.table.setRowCount(2)
+            self._row_to_id = [doc_id, doc_id]
 
-        r0 = 0
-        r1 = 1
-        vals_r1 = [
-            date,
-            debit,
-            f"{amount:,}",
-            credit,
-            f"{amount:,}",
-            summary,
-            tax,
-        ]
-        for j, v in enumerate(vals_r1):
-            if j in (5, 6):
-                continue
-            self.table.setItem(r0, j, QTableWidgetItem(str(v)))
+            r0 = 0
+            r1 = 1
+            vals_r1 = [
+                date,
+                debit,
+                f"{amount:,}",
+                credit,
+                f"{amount:,}",
+                summary,
+                tax,
+            ]
+            for j, v in enumerate(vals_r1):
+                if j in (5, 6):
+                    continue
+                self.table.setItem(r0, j, QTableWidgetItem(str(v)))
 
-        vals_r2 = [
-            "",
-            debit_sub,
-            "",
-            credit_sub,
-            "",
-            auto.get("invoice_status") or "",
-            "",
-        ]
-        for j, v in enumerate(vals_r2):
-            if j in (1, 3, 5):
-                continue
-            self.table.setItem(r1, j, QTableWidgetItem(str(v)))
+            vals_r2 = [
+                "",
+                debit_sub,
+                "",
+                credit_sub,
+                "",
+                auto.get("invoice_status") or "",
+                "",
+            ]
+            for j, v in enumerate(vals_r2):
+                if j in (1, 3, 5):
+                    continue
+                self.table.setItem(r1, j, QTableWidgetItem(str(v)))
 
-        self._setup_row_widgets(r0, r1, debit, credit, debit_sub, credit_sub, summary, tax)
+            self._setup_row_widgets(r0, r1, debit, credit, debit_sub, credit_sub, summary, tax)
 
         # Show the current document's PDF (first page by default)
         try:
@@ -3072,6 +3085,8 @@ class ReviewPage(QWidget):
         total = len(getattr(self, "_docs", []))
         if total == 0:
             return
+        # Cache current edits before leaving the page
+        self._cache_current_doc_edits()
         idx = getattr(self, "_doc_index", 0) + delta
         if idx < 0:
             idx = 0
@@ -3246,6 +3261,69 @@ class ReviewPage(QWidget):
                 continue
         return out
 
+    def _cache_current_doc_edits(self) -> None:
+        """Remember current table edits so paging does not drop them."""
+        try:
+            docs = getattr(self, "_docs", [])
+            if not docs:
+                return
+            idx = max(0, min(getattr(self, "_doc_index", 0), len(docs) - 1))
+            doc_id = int(docs[idx].get("id"))
+        except Exception:
+            return
+        try:
+            entries = self._collect_all_pairs()
+            if entries:
+                self._draft_edits[doc_id] = entries
+            else:
+                self._draft_edits.pop(doc_id, None)
+        except Exception:
+            pass
+
+    def _apply_cached_entries(self, doc_id: int) -> bool:
+        entries = self._draft_edits.get(doc_id) if hasattr(self, "_draft_edits") else None
+        if not entries:
+            return False
+        try:
+            self._loading = True
+            n_pairs = max(1, len(entries))
+            self.table.setRowCount(n_pairs * 2)
+            self._row_to_id = [doc_id] * (n_pairs * 2)
+            for i, ent in enumerate(entries):
+                r0 = i * 2
+                r1 = r0 + 1
+                date = ent.get("date") or ""
+                debit = ent.get("debit") or ""
+                credit = ent.get("credit") or ""
+                debit_sub = ent.get("debit_sub") or ""
+                credit_sub = ent.get("credit_sub") or ""
+                summary = ent.get("summary") or ""
+                invoice = ent.get("invoice_status") or ""
+                amt = ent.get("amount")
+                if isinstance(amt, int):
+                    amt_txt = f"{amt:,}"
+                else:
+                    amt_txt = str(amt) if amt not in (None, "") else ""
+                vals_r1 = [date, debit, amt_txt, credit, amt_txt, summary, invoice]
+                for j, v in enumerate(vals_r1):
+                    if j in (5, 6):
+                        continue
+                    self.table.setItem(r0, j, QTableWidgetItem(str(v)))
+                vals_r2 = ["", debit_sub, "", credit_sub, "", invoice, ""]
+                for j, v in enumerate(vals_r2):
+                    if j in (1, 3, 5):
+                        continue
+                    self.table.setItem(r1, j, QTableWidgetItem(str(v)))
+                self._setup_row_widgets(r0, r1, debit, credit, debit_sub, credit_sub, summary, invoice)
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                self._loading = False
+            except Exception:
+                pass
+
     def _save_selected(self) -> None:
         doc_id, r0, r1 = self._selected_doc_id_and_rows()
         if doc_id is None or r0 is None or r1 is None:
@@ -3331,6 +3409,11 @@ class ReviewPage(QWidget):
                         QMessageBox.information(self, "確認", f"仕訳を確認済みに移動しました。\n複数行CSVを出力しました:\n{path}")
                     else:
                         QMessageBox.information(self, "確認", "仕訳を確認済みに移動しました。")
+                    # Clear draft cache for this doc
+                    try:
+                        self._draft_edits.pop(doc_id, None)
+                    except Exception:
+                        pass
                     self._load_unconfirmed()
                     try:
                         win = self.window()
@@ -3383,6 +3466,11 @@ class ReviewPage(QWidget):
                     QMessageBox.information(self, "確認", f"仕訳を確認済みに移動しました。\n1行CSVを出力しました:\n{path}")
                 else:
                     QMessageBox.information(self, "確認", "仕訳を確認済みに移動しました。")
+                # Clear draft cache for this doc
+                try:
+                    self._draft_edits.pop(doc_id, None)
+                except Exception:
+                    pass
                 self._load_unconfirmed()
                 try:
                     win = self.window()

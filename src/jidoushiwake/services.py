@@ -156,7 +156,16 @@ def import_pdf(session: Session, company_id: int, pdf_path: Path) -> Document:
                     parsed.amount = int(llm_ref.get("amount"))
                 except Exception:
                     parsed.amount = llm_ref.get("amount")
-            parsed.summary = llm_ref.get("summary") or parsed.summary
+            # Summary: include issuer/store name if provided
+            issuer = (llm_ref.get("issuer") or "").strip()
+            summary_llm = llm_ref.get("summary") or ""
+            if issuer:
+                if summary_llm:
+                    parsed.summary = f"{issuer} {summary_llm}".strip()
+                else:
+                    parsed.summary = issuer
+            else:
+                parsed.summary = summary_llm or parsed.summary
             parsed.debit_account = llm_ref.get("debit_account") or parsed.debit_account
             parsed.credit_account = llm_ref.get("credit_account") or parsed.credit_account
             # Log LLM output
@@ -517,6 +526,66 @@ def _run_llm_refine_paginated(session: Session, company_id: int, texts: dict) ->
         pass
     hint_block = ("\n\n[学習ヒント]\n" + "\n".join(hints_lines)) if hints_lines else ""
 
+    # Build RAG from past auto_results: similarity pick + per-account balance
+    rag_lines: list[str] = []
+    try:
+        import re as _re
+        from sqlalchemy import select as _select
+
+        base_text = (texts.get("text_combined") or "").lower()
+        base_tokens = set(t for t in _re.findall(r"[0-9a-zA-Zぁ-んァ-ン一-龥]{2,}", base_text))
+
+        q = (
+            _select(AutoResult, Document)
+            .join(Document, AutoResult.document_id == Document.id)
+            .where(Document.company_id == company_id)
+            .order_by(Document.id.desc())
+            .limit(200)
+        )
+
+        buckets: dict[str, list[tuple[int, AutoResult, Document]]] = {}
+        for ar, doc in session.execute(q).all():
+            text = ((ar.summary or "") + " " + (ar.counterparty or "")).lower()
+            tokens = set(t for t in _re.findall(r"[0-9a-zA-Zぁ-んァ-ン一-龥]{2,}", text))
+            overlap = len(base_tokens & tokens)
+            key = ar.debit_account or ""
+            buckets.setdefault(key, []).append((overlap, ar, doc))
+
+        # pick best per debit_account (balance): top3 by similarity, then recency
+        picked: list[tuple[int, AutoResult, Document]] = []
+        for items in buckets.values():
+            items.sort(key=lambda x: (x[0], x[2].id), reverse=True)
+            picked.extend(items[:3])
+
+        # also take overall top by similarity to avoid missing dominant cases
+        all_items: list[tuple[int, AutoResult, Document]] = []
+        for items in buckets.values():
+            all_items.extend(items)
+        all_items.sort(key=lambda x: (x[0], x[2].id), reverse=True)
+        picked.extend(all_items[:20])
+
+        # de-dup and cap
+        seen_ids = set()
+        rag_entries: list[tuple[int, AutoResult, Document]] = []
+        for sc, ar, doc in sorted(picked, key=lambda x: (x[0], x[2].id), reverse=True):
+            if ar.id in seen_ids:
+                continue
+            seen_ids.add(ar.id)
+            rag_entries.append((sc, ar, doc))
+            if len(rag_entries) >= 40:
+                break
+
+        for sc, ar, doc in rag_entries:
+            summ = (ar.summary or ar.counterparty or "").strip()
+            if not summ:
+                continue
+            rag_lines.append(
+                f"- {summ} | amount={ar.amount or ''} debit={ar.debit_account or ''} credit={ar.credit_account or ''} inv={ar.invoice_status or ''} score={sc}"
+            )
+    except Exception:
+        rag_lines = []
+    rag_block = ("\n\n[過去仕訳RAG]\n" + "\n".join(rag_lines)) if rag_lines else ""
+
     votes_amount: dict[int, int] = {}
     votes_debit: dict[str, int] = {}
     votes_credit: dict[str, int] = {}
@@ -526,7 +595,7 @@ def _run_llm_refine_paginated(session: Session, company_id: int, texts: dict) ->
     for i in range(max_n):
         p_pdf = pdf_pages[i] if i < len(pdf_pages) else (pdf_pages[-1] if pdf_pages else "")
         p_yomi = yomi_pages[i] if i < len(yomi_pages) else (yomi_pages[-1] if yomi_pages else "")
-        aug_yomi = (p_yomi + hint_block).strip()
+        aug_yomi = (p_yomi + hint_block + rag_block).strip()
         try:
             # Use YOMITOKU-only refinement
             r = refine_extraction_with_yomi("", aug_yomi, "")

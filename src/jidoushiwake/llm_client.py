@@ -12,6 +12,27 @@ LOGGER = logging.getLogger(__name__)
 # Fixed model path (GPU llama.cpp only)
 DEFAULT_MODEL_PATH = Path(r"F:\models\Llama-3-ELYZA-JP-8B-q4_k_m.gguf")
 
+# RAG-like static knowledge for journal inference (実際の領収書を想定したキーワードと勘定)
+KNOWLEDGE_JOURNAL = """
+[仕訳ルール参照(RAG)] 伝票・領収書で実際に現れる店名や表記を想定
+- 給油/ガソリン/燃料: ENEOS, 出光, コスモ, エネオスSS, Shell, シェル, キグナス, 昭和シェル, モービル → 借方=車両費(燃料費) or 燃料費 / 貸方=決済手段
+- 高速/ETC/駐車場: ETC利用照会, 駐車料金, Times, NPC, 三井のリパーク → 借方=旅費交通費(高速/駐車場) / 貸方=決済手段
+- 交通系IC/乗車券/タクシー: スイカ/ Suica, PASMO, ICOCA, タクシー領収書(○○交通, ○○ハイヤー), JR券売機, 新幹線, バス回数券 → 借方=旅費交通費 / 貸方=決済手段
+- 外食/会食/飲食店: 居酒屋, レストラン, ○○食堂, ○○寿司, ○○ラーメン, 喫茶, スターバックス, ドトール, コメダ, サイゼリヤ → 借方=交際費（社外対応） or 会議費（社内少額） / 貸方=決済手段
+- 小売/日用品/文具: セブン‐イレブン, ファミリーマート, ローソン, ミニストップ, 東急ハンズ, ロフト, コクヨ, カインズ, コーナン, ビバホーム, Daiso, Seria → 少額消耗なら借方=消耗品費 / 貸方=決済手段
+- 事務用品/印刷: プリンタ, インク, トナー, コピー用紙, 印刷代, 名刺印刷 → 借方=消耗品費 or 事務用品費 / 貸方=決済手段
+- 通信/携帯/回線: NTTドコモ, au, ソフトバンク, 楽天モバイル, フレッツ, ひかり, Wi-Fi, プロバイダ → 借方=通信費 / 貸方=決済手段
+- クラウド/ITサービス/サブスク: Google, Microsoft, Adobe, AWS, Azure, GCP, Slack, Zoom, Notion, Dropbox → 借方=通信費 or ソフトウェア / 貸方=決済手段
+- 配送/郵便/宅配: ヤマト運輸, 佐川急便, 日本郵便, ゆうパック, レターパック, クリックポスト, DHL, FedEx → 借方=通信運搬費 / 貸方=決済手段
+- 広告/マーケ出稿: Meta広告, Facebook広告, Google広告, X(旧Twitter)広告, LINE広告, リスティング, バナー → 借方=広告宣伝費 / 貸方=決済手段
+- オフィス賃料/スペース: 賃料, 家賃, 共益費, WeWork, レンタルオフィス, 会議室レンタル → 借方=地代家賃 / 貸方=決済手段
+- 光熱: 電気, ガス, 水道, 検針票/請求書, ○○電力, ○○ガス, ○○水道局 → 借方=水道光熱費 / 貸方=決済手段
+- 修繕/保守/クリーニング: 修理, 保守, 点検, クリーニング, 設備メンテ → 借方=修繕費 / 貸方=決済手段
+- 教育/研修/書籍: セミナー, 研修, 受講料, ○○カレッジ, 書籍, 技術書, 勉強会 → 借方=研修費 or 図書研修費 / 貸方=決済手段
+- 宿泊/出張: ホテル, ビジネスホテル, 宿泊税, Airbnb, 旅館 → 借方=旅費交通費(宿泊費) / 貸方=決済手段
+- 決済手段の基本: 現金→貸方=現金、銀行引落/振込→貸方=普通預金、クレカ→貸方=未払金(カード名等)、振込受取→借方=普通預金
+"""
+
 
 @dataclass
 class LLMConfig:
@@ -136,7 +157,7 @@ def _json_from_text(text: str) -> Optional[Dict[str, Any]]:
                 v = None
             norm[k] = v
             if v not in (None, ""):
-                filled += 1
+                filled += 2 if k == "amount" else 1  # prefer candidates that include amount
         # keep other keys if present
         for k, v in d.items():
             if k not in norm:
@@ -209,10 +230,15 @@ def refine_extraction(text_pdf: str, text_paddle: str) -> Optional[Dict[str, Any
     base_prompt = (
         "以下は領収書・請求書などの日本語OCRテキストです。\n"
         "2種類のOCR結果（PDF埋め込みテキスト、画像OCR=PaddleOCR）を渡します。\n"
-        "取引の基本項目（日付YYYY/MM/DD、金額=整数）、摘要（4〜30文字程度）、借方勘定科目、貸方勘定科目を推定し、\n"
+        "取引の基本項目（日付YYYY/MM/DD、金額=整数）、摘要（発行元の会社名/店名を含め4〜30文字程度）、借方勘定科目、貸方勘定科目を推定し、\n"
+        "金額は「合計/総計/請求金額/支払額/税込」を最優先し、無ければ複数候補の中で最大の値を採用してください。\n"
+        "消費税額と税率（8/10など）が読み取れれば tax_amount, tax_rate も返してください。\n"
+        "仕訳の基本ルール: 決済手段が不明なときは基本的に credit=現金 とする。銀行引落が読み取れたら credit=普通預金、クレカ払が読み取れたら credit=未払金(カード名等)、振込受取なら debit=普通預金。商品/サービスの内容に応じて debit を選ぶ（例: ガソリン/交通→車両費/旅費交通費、飲食→交際費、文具/用品→消耗品費）。\n"
+        "インボイス判定も返してください。知識: インボイス登録番号は先頭\"T\"+13桁(例: T1234567890123)。ハイフン区切り(T1-2345-6789-0123)も同じ番号として扱い、番号があれば invoice_status=\"適格\"。領収書/請求書等の記載はあるが番号が無ければ \"非適格\"。非課税/不課税/対象外などの語があれば \"非課税\"。判断不能は null。\n"
+        + KNOWLEDGE_JOURNAL + "\n"
         "信頼度(0-1)を含めてJSONで返してください。\n"
-        "出力キー: date, amount, summary, debit_account, credit_account, confidence\n"
-        "金額は数値のみ。日付はYYYY/MM/DD。未知はnull。\n"
+        "出力キー: date, amount, tax_amount, tax_rate, summary, issuer, debit_account, credit_account, confidence, invoice_status\n"
+        "金額は数値のみ。日付はYYYY/MM/DD。税率は整数(8/10など)。未知はnull。\n"
         "[PDF埋め込みテキスト]\n" + (text_pdf or "") + "\n\n"
         "[画像OCR(PaddleOCR)]\n" + (text_paddle or "") + "\n\n"
         "JSONだけを出力してください。余計な説明は不要です。"
@@ -229,10 +255,14 @@ def refine_extraction(text_pdf: str, text_paddle: str) -> Optional[Dict[str, Any
     return {
         "date": data.get("date"),
         "amount": data.get("amount"),
+        "tax_amount": data.get("tax_amount"),
+        "tax_rate": data.get("tax_rate"),
         "summary": data.get("summary"),
+        "issuer": data.get("issuer"),
         "debit_account": data.get("debit_account"),
         "credit_account": data.get("credit_account"),
         "confidence": data.get("confidence"),
+        "invoice_status": data.get("invoice_status"),
     }
 
 
@@ -248,10 +278,15 @@ def refine_extraction_with_yomi(text_pdf: str, text_yomitoku: str = "", text_pad
     base_prompt = (
         "以下は領収書・請求書などの日本語OCRテキストです。\n"
         "最大3種類の結果（PDF埋め込みテキスト、YOMITOKU、画像OCR=PaddleOCR）を渡します。\n"
-        "取引の基本項目（日付YYYY/MM/DD、金額=整数）、摘要（4〜30文字程度）、借方勘定科目、貸方勘定科目を推定し、\n"
+        "取引の基本項目（日付YYYY/MM/DD、金額=整数）、摘要（発行元の会社名/店名を含め4〜30文字程度）、借方勘定科目、貸方勘定科目を推定し、\n"
+        "金額は「合計/総計/請求金額/支払額/税込」を最優先し、無ければ複数候補の中で最大の値を採用してください。\n"
+        "消費税額と税率（8/10など）が読み取れれば tax_amount, tax_rate も返してください。\n"
+        "仕訳の基本ルール: 決済手段が不明なときは基本的に credit=現金 とする。銀行引落が読み取れたら credit=普通預金、クレカ払が読み取れたら credit=未払金(カード名等)、振込受取なら debit=普通預金。商品/サービスの内容に応じて debit を選ぶ（例: ガソリン/交通→車両費/旅費交通費、飲食→交際費、文具/用品→消耗品費）。\n"
+        "インボイス判定も返してください。知識: インボイス登録番号は先頭\"T\"+13桁(例: T1234567890123)。ハイフン区切り(T1-2345-6789-0123)も同じ番号として扱い、番号があれば invoice_status=\"適格\"。領収書/請求書等の記載はあるが番号が無ければ \"非適格\"。非課税/不課税/対象外などの語があれば \"非課税\"。判断不能は null。\n"
+        + KNOWLEDGE_JOURNAL + "\n"
         "信頼度(0-1)を含めてJSONで返してください。\n"
-        "出力キー: date, amount, summary, debit_account, credit_account, confidence\n"
-        "金額は数値のみ。日付はYYYY/MM/DD。未知はnull。\n"
+        "出力キー: date, amount, tax_amount, tax_rate, summary, issuer, debit_account, credit_account, confidence, invoice_status\n"
+        "金額は数値のみ。日付はYYYY/MM/DD。税率は整数(8/10など)。未知はnull。\n"
         + "\n\n".join(sections)
         + "\n\nJSONだけを出力してください。余計な説明は不要です。"
     )
@@ -267,10 +302,14 @@ def refine_extraction_with_yomi(text_pdf: str, text_yomitoku: str = "", text_pad
     return {
         "date": data.get("date"),
         "amount": data.get("amount"),
+        "tax_amount": data.get("tax_amount"),
+        "tax_rate": data.get("tax_rate"),
         "summary": data.get("summary"),
+        "issuer": data.get("issuer"),
         "debit_account": data.get("debit_account"),
         "credit_account": data.get("credit_account"),
         "confidence": data.get("confidence"),
+        "invoice_status": data.get("invoice_status"),
     }
 
 
