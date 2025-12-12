@@ -18,6 +18,7 @@ KNOWLEDGE_JOURNAL = """
 - 給油/ガソリン/燃料: ENEOS, 出光, コスモ, エネオスSS, Shell, シェル, キグナス, 昭和シェル, モービル → 借方=車両費(燃料費) or 燃料費 / 貸方=決済手段
 - 高速/ETC/駐車場: ETC利用照会, 駐車料金, Times, NPC, 三井のリパーク → 借方=旅費交通費(高速/駐車場) / 貸方=決済手段
 - 交通系IC/乗車券/タクシー: スイカ/ Suica, PASMO, ICOCA, タクシー領収書(○○交通, ○○ハイヤー), JR券売機, 新幹線, バス回数券 → 借方=旅費交通費 / 貸方=決済手段
+- 交通系IC/乗車券: スイカ/ Suica, PASMO, ICOCA, JR券売機, 新幹線, バス回数券 → 借方=旅費交通費 / 貸方=決済手段
 - 外食/会食/飲食店: 居酒屋, レストラン, ○○食堂, ○○寿司, ○○ラーメン, 喫茶, スターバックス, ドトール, コメダ, サイゼリヤ → 借方=交際費（社外対応） or 会議費（社内少額） / 貸方=決済手段
 - 小売/日用品/文具: セブン‐イレブン, ファミリーマート, ローソン, ミニストップ, 東急ハンズ, ロフト, コクヨ, カインズ, コーナン, ビバホーム, Daiso, Seria → 少額消耗なら借方=消耗品費 / 貸方=決済手段
 - 事務用品/印刷: プリンタ, インク, トナー, コピー用紙, 印刷代, 名刺印刷 → 借方=消耗品費 or 事務用品費 / 貸方=決済手段
@@ -211,6 +212,34 @@ def _json_from_text(text: str) -> Optional[Dict[str, Any]]:
     return best[1] if best else None
 
 
+def _enforce_taxi_rule(src_texts: List[str], data: Dict[str, Any]) -> None:
+    """Override debit to taxi fare when taxi cues are present."""
+    text_blob = " ".join(t for t in src_texts if t)
+    flat = text_blob.replace(" ", "").replace("\n", "").replace("\t", "")
+    import re as _re
+    taxi_keywords = [
+        "タクシー",
+        "ﾀｸｼｰ",
+        "タクシ",
+        "ﾀｸｼ",
+        "メータ",
+        "迎車",
+        "配車",
+        "運賃",
+        "ハイヤー",
+        "交通株式会社",
+        "タクシー株式会社",
+    ]
+    has_taxi = any(k in text_blob for k in taxi_keywords)
+    has_taxi = has_taxi or "交通株" in flat or bool(_re.search(r"交通\\s*株", text_blob)) or bool(_re.search(r"交通.*(株|株式会社)", text_blob))
+    if has_taxi:
+        data["debit_account"] = "旅費交通費"
+        # If summary is missing or短すぎ, append taxi hint
+        summary = (data.get("summary") or "").strip()
+        if "タクシ" not in summary:
+            data["summary"] = (summary + " タクシー利用").strip()
+
+
 def _complete(prompt: str, max_tokens: int, temperature: float, stop: Optional[List[str]]) -> Optional[str]:
     llm = _load_llama()
     if not llm:
@@ -227,20 +256,22 @@ def _complete(prompt: str, max_tokens: int, temperature: float, stop: Optional[L
 
 def refine_extraction(text_pdf: str, text_paddle: str) -> Optional[Dict[str, Any]]:
     """Use the local GPU LLM to refine field extraction. Returns dict or None."""
+    # Ignore embedded PDF text and PaddleOCR; rely on upstream OCR only
+    src_texts = [text_pdf or "", text_paddle or ""]
+    text_pdf = ""
+    text_paddle = ""
     base_prompt = (
         "以下は領収書・請求書などの日本語OCRテキストです。\n"
-        "2種類のOCR結果（PDF埋め込みテキスト、画像OCR=PaddleOCR）を渡します。\n"
+        "【最優先】タクシー/メータ運賃/迎車/配車/タクシー会社名（○○交通/○○タクシー/○○ハイヤー/○○交通株式会社など）が1つでもあれば、借方=旅費交通費 とし、摘要にもタクシー利用を含める。\n"
         "取引の基本項目（日付YYYY/MM/DD、金額=整数）、摘要（発行元の会社名/店名を含め4〜30文字程度）、借方勘定科目、貸方勘定科目を推定し、\n"
-        "金額は「合計/総計/請求金額/支払額/税込」を最優先し、無ければ複数候補の中で最大の値を採用してください。\n"
         "消費税額と税率（8/10など）が読み取れれば tax_amount, tax_rate も返してください。\n"
-        "仕訳の基本ルール: 決済手段が不明なときは基本的に credit=現金 とする。銀行引落が読み取れたら credit=普通預金、クレカ払が読み取れたら credit=未払金(カード名等)、振込受取なら debit=普通預金。商品/サービスの内容に応じて debit を選ぶ（例: ガソリン/交通→車両費/旅費交通費、飲食→交際費、文具/用品→消耗品費）。\n"
+        "仕訳の基本ルール: 決済手段が不明なときは常に credit=現金 とする。クレカ払が読み取れたら credit=未払金(カード名等) とし、それ以外で預金を使うことはない。商品/サービスの内容に応じて debit を選ぶ（例: ガソリン/交通→車両費/旅費交通費、飲食→交際費、文具/用品→消耗品費）。タクシー/メータ運賃/○○交通株式会社/○○ハイヤー/○○タクシー/迎車/配車などがあれば必ず借方=旅費交通費 とする。\n"
         "インボイス判定も返してください。知識: インボイス登録番号は先頭\"T\"+13桁(例: T1234567890123)。ハイフン区切り(T1-2345-6789-0123)も同じ番号として扱い、番号があれば invoice_status=\"適格\"。領収書/請求書等の記載はあるが番号が無ければ \"非適格\"。非課税/不課税/対象外などの語があれば \"非課税\"。判断不能は null。\n"
         + KNOWLEDGE_JOURNAL + "\n"
         "信頼度(0-1)を含めてJSONで返してください。\n"
         "出力キー: date, amount, tax_amount, tax_rate, summary, issuer, debit_account, credit_account, confidence, invoice_status\n"
         "金額は数値のみ。日付はYYYY/MM/DD。税率は整数(8/10など)。未知はnull。\n"
-        "[PDF埋め込みテキスト]\n" + (text_pdf or "") + "\n\n"
-        "[画像OCR(PaddleOCR)]\n" + (text_paddle or "") + "\n\n"
+        "[OCRテキスト]\n" + (text_pdf or "") + "\n\n"
         "JSONだけを出力してください。余計な説明は不要です。"
     )
     prompt = _apply_template(base_prompt)
@@ -252,6 +283,7 @@ def refine_extraction(text_pdf: str, text_paddle: str) -> Optional[Dict[str, Any
     if not isinstance(data, dict):
         LOGGER.warning("LLM refine returned non-JSON: %s", text[:200])
         return None
+    _enforce_taxi_rule(src_texts + [str(data.get("summary") or ""), str(data.get("issuer") or "")], data)
     return {
         "date": data.get("date"),
         "amount": data.get("amount"),
@@ -268,20 +300,20 @@ def refine_extraction(text_pdf: str, text_paddle: str) -> Optional[Dict[str, Any
 
 def refine_extraction_with_yomi(text_pdf: str, text_yomitoku: str = "", text_paddle: str = "") -> Optional[Dict[str, Any]]:
     """Refine field extraction using up to three sources: PDF text, YOMITOKU, and image OCR."""
+    # Ignore embedded PDF text and PaddleOCR; rely on upstream OCR only
+    src_texts = [text_pdf or "", text_yomitoku or "", text_paddle or ""]
+    text_pdf = ""
+    text_paddle = ""
     sections: list[str] = []
-    sections.append("[PDF埋め込みテキスト]\n" + (text_pdf or ""))
     if (text_yomitoku or "").strip():
         sections.append("[YOMITOKU(マークダウン結合)]\n" + (text_yomitoku or ""))
-    if (text_paddle or "").strip():
-        sections.append("[画像OCR(PaddleOCR)]\n" + (text_paddle or ""))
 
     base_prompt = (
         "以下は領収書・請求書などの日本語OCRテキストです。\n"
-        "最大3種類の結果（PDF埋め込みテキスト、YOMITOKU、画像OCR=PaddleOCR）を渡します。\n"
+        "【最優先】タクシー/メータ運賃/迎車/配車/タクシー会社名（○○交通/○○タクシー/○○ハイヤー/○○交通株式会社など）が1つでもあれば、借方=旅費交通費 とし、摘要にもタクシー利用を含める。\n"
         "取引の基本項目（日付YYYY/MM/DD、金額=整数）、摘要（発行元の会社名/店名を含め4〜30文字程度）、借方勘定科目、貸方勘定科目を推定し、\n"
-        "金額は「合計/総計/請求金額/支払額/税込」を最優先し、無ければ複数候補の中で最大の値を採用してください。\n"
         "消費税額と税率（8/10など）が読み取れれば tax_amount, tax_rate も返してください。\n"
-        "仕訳の基本ルール: 決済手段が不明なときは基本的に credit=現金 とする。銀行引落が読み取れたら credit=普通預金、クレカ払が読み取れたら credit=未払金(カード名等)、振込受取なら debit=普通預金。商品/サービスの内容に応じて debit を選ぶ（例: ガソリン/交通→車両費/旅費交通費、飲食→交際費、文具/用品→消耗品費）。\n"
+        "仕訳の基本ルール: 決済手段が不明なときは常に credit=現金 とする。クレカ払が読み取れたら credit=未払金(カード名等) とし、それ以外で預金を使うことはない。商品/サービスの内容に応じて debit を選ぶ（例: ガソリン/交通→車両費/旅費交通費、飲食→交際費、文具/用品→消耗品費）。タクシー/メータ運賃/○○交通株式会社/○○ハイヤー/○○タクシー/迎車/配車などがあれば必ず借方=旅費交通費 とする。\n"
         "インボイス判定も返してください。知識: インボイス登録番号は先頭\"T\"+13桁(例: T1234567890123)。ハイフン区切り(T1-2345-6789-0123)も同じ番号として扱い、番号があれば invoice_status=\"適格\"。領収書/請求書等の記載はあるが番号が無ければ \"非適格\"。非課税/不課税/対象外などの語があれば \"非課税\"。判断不能は null。\n"
         + KNOWLEDGE_JOURNAL + "\n"
         "信頼度(0-1)を含めてJSONで返してください。\n"
@@ -299,6 +331,7 @@ def refine_extraction_with_yomi(text_pdf: str, text_yomitoku: str = "", text_pad
     if not isinstance(data, dict):
         LOGGER.warning("LLM refine (with yomi) returned non-JSON: %s", text[:200])
         return None
+    _enforce_taxi_rule(src_texts + [str(data.get("summary") or ""), str(data.get("issuer") or "")], data)
     return {
         "date": data.get("date"),
         "amount": data.get("amount"),

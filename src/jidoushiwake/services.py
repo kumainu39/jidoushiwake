@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 from typing import Optional
 import os
+import re
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -538,7 +539,10 @@ def _run_llm_refine_paginated(session: Session, company_id: int, texts: dict) ->
         q = (
             _select(AutoResult, Document)
             .join(Document, AutoResult.document_id == Document.id)
-            .where(Document.company_id == company_id)
+            .where(
+                Document.company_id == company_id,
+                Document.status == DocumentStatusEnum.CONFIRMED.value,
+            )
             .order_by(Document.id.desc())
             .limit(200)
         )
@@ -580,7 +584,7 @@ def _run_llm_refine_paginated(session: Session, company_id: int, texts: dict) ->
             if not summ:
                 continue
             rag_lines.append(
-                f"- {summ} | amount={ar.amount or ''} debit={ar.debit_account or ''} credit={ar.credit_account or ''} inv={ar.invoice_status or ''} score={sc}"
+                f"- {summ} | debit={ar.debit_account or ''} credit={ar.credit_account or ''} inv={ar.invoice_status or ''} score={sc}"
             )
     except Exception:
         rag_lines = []
@@ -1174,7 +1178,16 @@ def export_confirmed_csv(
             included_ids.append(int(d.id))
 
     settings = get_settings()
-    target_dir = output_dir or settings.output_dir
+    cs = get_company_settings(session, company_id)
+    base_dir = Path(cs.default_output_dir) if cs.default_output_dir else settings.output_dir
+    # Place outputs under company-named subfolder when not explicitly overridden
+    try:
+        company = session.get(Company, company_id)
+        name = company.name if company else str(company_id)
+        slug = re.sub(r'[\\\\/:*?"<>|]', "_", name).strip() or str(company_id)
+    except Exception:
+        slug = str(company_id)
+    target_dir = output_dir or (base_dir / slug)
     target_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = target_dir / f"{ts}_yayoi.csv"

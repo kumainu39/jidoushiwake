@@ -2357,11 +2357,12 @@ class ReviewPage(QWidget):
         btn_row.addWidget(self.btn_later)
         btn_row.addWidget(self.btn_delete)
 
-        # Tax category quick apply and PDF pager
+        # Preload tax categories for per-row comboboxes
+        self._tax_map: dict[str, str] = {}
+        self._load_tax_categories()
+
+        # PDF pager
         util_row = QHBoxLayout()
-        self.tax_combo = QComboBox(); self._load_tax_categories()
-        apply_tax = QPushButton("税区分適用")
-        apply_tax.clicked.connect(self._apply_tax_combo)  # type: ignore[arg-type]
         self.page_prev = QPushButton("＜")
         self.page_next = QPushButton("＞")
         self.page_label = QLabel("1/1")
@@ -2373,9 +2374,6 @@ class ReviewPage(QWidget):
         self.pdf_page_label = QLabel("0/0")
         self.pdf_prev.clicked.connect(lambda: self._change_pdf_page(-1))  # type: ignore[arg-type]
         self.pdf_next.clicked.connect(lambda: self._change_pdf_page(1))  # type: ignore[arg-type]
-        util_row.addWidget(QLabel("税区分:"))
-        util_row.addWidget(self.tax_combo)
-        util_row.addWidget(apply_tax)
         util_row.addStretch(1)
         util_row.addWidget(self.pdf_prev)
         util_row.addWidget(self.pdf_page_label)
@@ -2572,11 +2570,9 @@ class ReviewPage(QWidget):
             r = requests.get(f"{API_URL}/tax_categories", timeout=10)
             if r.ok:
                 self._tax_map = {}
-                self.tax_combo.clear()
                 for row in r.json():
                     name = row.get("name") or ""
                     code = row.get("code") or name
-                    self.tax_combo.addItem(name, code)
                     self._tax_map[code] = name
         except Exception:
             pass
@@ -2814,8 +2810,43 @@ class ReviewPage(QWidget):
         except Exception:
             pass
         tcb.setEditable(False)
-        tcb.setCurrentText(tax_name or "")
+        # Decide default tax category: prefer provided tax_name; otherwise infer from invoice status
+        default_tax = tax_name or self._guess_tax_category(tax_name)
+        if default_tax:
+            tcb.setCurrentText(default_tax)
         self.table.setCellWidget(r1, 5, tcb)
+
+    def _guess_tax_category(self, invoice_status: Optional[str]) -> str:
+        """Infer a sensible default tax category from invoice status and available master."""
+        names = list(getattr(self, "_tax_map", {}).values())
+        if not names:
+            return ""
+        inv = (invoice_status or "").strip()
+
+        def _pick(pred) -> str:
+            for n in names:
+                try:
+                    if pred(n):
+                        return n
+                except Exception:
+                    continue
+            return ""
+
+        if "非課税" in inv:
+            n = _pick(lambda s: "非課税" in s)
+            if n:
+                return n
+        if "適格" in inv:
+            n = _pick(lambda s: ("適格" in s) and ("10" in s or "８" in s))
+            if n:
+                return n
+        n = _pick(lambda s: "10" in s)
+        if n:
+            return n
+        n = _pick(lambda s: "8" in s or "８" in s)
+        if n:
+            return n
+        return names[0]
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         if getattr(self, "_loading", False) or getattr(self, "_syncing_amount", False):
@@ -3158,29 +3189,6 @@ class ReviewPage(QWidget):
         except Exception:
             pass
         return super().eventFilter(obj, event)
-
-    def _apply_tax_combo(self) -> None:
-        # apply selected tax category display name to table second row tax cell
-        sel = self.table.selectedIndexes()
-        if not sel:
-            return
-        r = sel[0].row()
-        r1 = r - (r % 2) + 1
-        code = self.tax_combo.currentData()
-        name = self.tax_combo.currentText()
-        item = QTableWidgetItem(f"税区分: {name}")
-        item.setForeground(QBrush(QColor(90,90,90)))
-        # tax cell column index 5 in our 7-column layout
-        self.table.setItem(r1, 5, item)
-        # 直後にウィジェットへ反映して Item を除去（二重描画防止）
-        try:
-            w = self.table.cellWidget(r1, 5)
-            if isinstance(w, QComboBox):
-                if name:
-                    w.setCurrentText(name)
-                self.table.takeItem(r1, 5)
-        except Exception:
-            pass
 
     # Save/later/delete
     def _selected_doc_id_and_rows(self) -> tuple[Optional[int], Optional[int], Optional[int]]:
